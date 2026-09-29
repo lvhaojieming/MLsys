@@ -11,9 +11,10 @@ architecture and expert inventory are fixed.
 frozen base-model token embeddings [B, T, D]
              |
              v
-L1 quality router: first / middle / last prompt windows
-             -> projection -> two lightweight Transformer encoder layers
-             -> attention pooling per window -> M expert logits
+L1 quality router: every prompt token
+             -> projection -> local Transformer layer over all token chunks
+             -> global Transformer layer over all chunk summaries
+             -> attention pooling -> M expert logits
              |
              v
 mask experts with no READY compatible replica; choose one expert
@@ -26,7 +27,7 @@ one request remains on this expert + replica for all prefill and decode
 ```
 
 L1 produces **one logit vector per entire request**, never per-token decisions.
-It uses prompt embeddings, original prompt length and the caller's output budget.
+It uses all prompt embeddings, prompt length and the caller's output budget.
 The base embedding layer stays outside this package and should be frozen. The
 config's ordered `expert_ids` defines the exact output-head order. A different
 base model, such as Qwen3-8B, needs a separate config and router.
@@ -60,14 +61,15 @@ prefill and decode routing. There is no teacher model or queue-price objective.
   full LLM forward pass.
 - `attention_mask`: `[B, T]`, right-padded, with at least one valid token per row.
 - `max_new_tokens`: `[B]`, the request's generation budget.
-- `original_prompt_lengths`: optional `[B]` if upstream has already preserved
-  first/middle/last windows while shortening a long prompt.
 
-The module selects up to `tokens_per_region` tokens from the beginning, center
-and end of each prompt, projects to `hidden_dim`, adds local position and region
-embeddings, runs two small Transformer encoder layers, attention-pools each region,
-then emits `[B, M]` **raw logits**. There is no softmax or availability masking
-inside the neural network: the registry changes independently of its weights.
+The module consumes **every valid prompt token**. It projects to `hidden_dim`,
+runs one local Transformer layer separately over consecutive `chunk_size` token
+blocks, attention-pools each block, then runs one global Transformer layer over
+all block summaries. A final attention pool and MLP emit `[B, M]` **raw logits**.
+For an 8K-token prompt with `chunk_size=128`, all 8K tokens contribute through
+64 block summaries. No prompt truncation or head/middle/tail sampling is used.
+There is no softmax or availability masking inside the neural network: the
+registry changes independently of its weights.
 
 ```python
 import torch

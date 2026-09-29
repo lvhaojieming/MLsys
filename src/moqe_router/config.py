@@ -12,11 +12,11 @@ class RouterArchitecture:
     model_family: str
     expert_ids: tuple[str, ...]
     embedding_dim: int
-    architecture_version: str = "embedding-router-v1"
+    architecture_version: str = "full-token-hierarchical-v2"
     hidden_dim: int = 256
     num_heads: int = 4
     encoder_layers: int = 2
-    tokens_per_region: int = 128
+    chunk_size: int = 128
     dropout: float = 0.1
     length_scale: int = 8192
     generation_scale: int = 2048
@@ -32,8 +32,10 @@ class RouterArchitecture:
             raise ValueError("embedding_dim and hidden_dim must be positive")
         if self.num_heads < 1 or self.hidden_dim % self.num_heads:
             raise ValueError("hidden_dim must be divisible by num_heads")
-        if self.encoder_layers < 1 or self.tokens_per_region < 1:
-            raise ValueError("encoder_layers and tokens_per_region must be positive")
+        if self.encoder_layers != 2:
+            raise ValueError("this architecture has exactly two Transformer layers")
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
         if self.length_scale <= 0 or self.generation_scale <= 0:

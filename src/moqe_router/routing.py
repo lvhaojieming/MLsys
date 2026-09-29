@@ -38,8 +38,6 @@ class TwoStageRouter:
         embeddings: Tensor,
         attention_mask: Tensor,
         max_new_tokens: Tensor,
-        *,
-        original_prompt_lengths: Tensor | None = None,
     ) -> RoutingDecision:
         if embeddings.shape[0] != 1:
             raise ValueError("route() handles one request; batch the quality model separately")
@@ -47,21 +45,12 @@ class TwoStageRouter:
         snapshot = self.registry.snapshot()
         visible_length = int(attention_mask[0].sum().item())
         required_context = visible_length + int(max_new_tokens[0].item())
-        if original_prompt_lengths is not None:
-            required_context = int(original_prompt_lengths[0].item()) + int(
-                max_new_tokens[0].item()
-            )
         eligible = snapshot.eligible_experts(config.model_family, required_context)
         if not eligible.intersection(config.expert_ids):
             raise RouteUnavailable("no compatible READY expert")
 
         self.quality_router.eval()
-        logits = self.quality_router(
-            embeddings,
-            attention_mask,
-            max_new_tokens,
-            original_prompt_lengths=original_prompt_lengths,
-        )[0]
+        logits = self.quality_router(embeddings, attention_mask, max_new_tokens)[0]
         if not bool(torch.isfinite(logits).all()):
             raise ValueError("quality router produced non-finite logits")
         ranking = tuple(

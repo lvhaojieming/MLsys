@@ -1,7 +1,7 @@
-"""L1 quality router operating strictly *after* a frozen token embedding layer.
+"""Full-token L1 router after a frozen base-model token embedding layer.
 
-The module returns one expert logit vector per request. It contains no language
-model, teacher, loss function, or per-token routing decision.
+Every valid prompt token contributes to one sequence-level expert logit vector.
+There is no teacher, expert forward pass, or per-token routing decision here.
 """
 
 from __future__ import annotations
@@ -10,46 +10,50 @@ import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .config import RouterArchitecture
 
 
 class EmbeddingRouter(nn.Module):
-    """Encode the first, middle and last prompt regions and score experts.
+    """Two-level hierarchical encoding with exactly two Transformer layers.
 
-    ``embeddings`` are outputs of the frozen base model's *token embedding*
-    layer, shaped ``[batch, padded_tokens, embedding_dim]``. ``attention_mask``
-    is right-padded (ones followed by zeros). No expert model is executed here.
+    Layer 1 attends locally over *every* token in nonoverlapping chunks. Layer 2
+    attends globally over all chunk summaries. This avoids the T-squared cost
+    of full attention on a long prompt while retaining every token's influence.
     """
 
     def __init__(self, config: RouterArchitecture) -> None:
         super().__init__()
         self.config = config
         hidden = config.hidden_dim
-        width = config.tokens_per_region
-
         self.input_projection = nn.Sequential(
             nn.Linear(config.embedding_dim, hidden),
             nn.LayerNorm(hidden),
         )
-        self.position_embedding = nn.Embedding(width, hidden)
-        self.region_embedding = nn.Embedding(3, hidden)
-        layer = nn.TransformerEncoderLayer(
-            d_model=hidden,
-            nhead=config.num_heads,
-            dim_feedforward=2 * hidden,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+
+        def encoder_layer() -> nn.TransformerEncoderLayer:
+            return nn.TransformerEncoderLayer(
+                d_model=hidden,
+                nhead=config.num_heads,
+                dim_feedforward=2 * hidden,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+
+        self.local_encoder = nn.TransformerEncoder(
+            encoder_layer(), num_layers=1, enable_nested_tensor=False
         )
-        self.encoder = nn.TransformerEncoder(
-            layer, num_layers=config.encoder_layers, enable_nested_tensor=False
+        self.global_encoder = nn.TransformerEncoder(
+            encoder_layer(), num_layers=1, enable_nested_tensor=False
         )
-        self.pool_score = nn.Linear(hidden, 1)
+        self.token_pool_score = nn.Linear(hidden, 1)
+        self.chunk_pool_score = nn.Linear(hidden, 1)
         self.head = nn.Sequential(
-            nn.LayerNorm(3 * hidden + 2),
-            nn.Linear(3 * hidden + 2, hidden),
+            nn.LayerNorm(hidden + 2),
+            nn.Linear(hidden + 2, hidden),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(hidden, len(config.expert_ids)),
@@ -82,71 +86,74 @@ class EmbeddingRouter(nn.Module):
         if bool((max_new_tokens < 0).any()):
             raise ValueError("max_new_tokens cannot be negative")
 
-    def _three_regions(self, embeddings: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        """Return [B, 3, W, D] and its validity mask without Python batch loops."""
-        batch, tokens, _ = embeddings.shape
-        width = self.config.tokens_per_region
-        lengths = mask.sum(dim=1)
-        zeros = torch.zeros_like(lengths)
-        starts = torch.stack(
-            (zeros, ((lengths - width) // 2).clamp_min(0), (lengths - width).clamp_min(0)),
-            dim=1,
+    @staticmethod
+    def _position_encoding(length: int, hidden: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Sinusoidal positions support any prompt/chunk count without a learned cap."""
+        positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+        half = hidden // 2
+        frequencies = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=device, dtype=torch.float32)
+            / max(half - 1, 1)
         )
-        indices = starts.unsqueeze(-1) + torch.arange(width, device=embeddings.device)
-        valid = indices < lengths[:, None, None]
-        safe_indices = indices.clamp_max(tokens - 1)
-        batch_indices = torch.arange(batch, device=embeddings.device)[:, None, None]
-        regions = embeddings[batch_indices, safe_indices]
-        return regions.masked_fill(~valid.unsqueeze(-1), 0), valid
+        phases = positions * frequencies[None, :]
+        encoding = torch.zeros(length, hidden, device=device, dtype=torch.float32)
+        encoding[:, 0 : 2 * half : 2] = phases.sin()
+        encoding[:, 1 : 2 * half : 2] = phases.cos()
+        return encoding.to(dtype)
 
-    def forward(
-        self,
-        embeddings: Tensor,
-        attention_mask: Tensor,
-        max_new_tokens: Tensor,
-        *,
-        original_prompt_lengths: Tensor | None = None,
-    ) -> Tensor:
-        """Return raw logits in ``config.expert_ids`` order, shape ``[B, M]``.
+    def forward(self, embeddings: Tensor, attention_mask: Tensor, max_new_tokens: Tensor) -> Tensor:
+        """Return one `[M]` raw-logit vector per sequence, in expert ID order.
 
-        ``original_prompt_lengths`` is optional metadata for a caller that has
-        already shortened the sequence before embedding extraction. The first,
-        middle and last windows must still be preserved by that caller.
+        ``embeddings`` must cover the *entire* visible prompt. No head/middle/
+        tail sampling, truncation, or precomputed summary is accepted.
         """
         self._validate_inputs(
             embeddings, attention_mask, max_new_tokens, self.config.embedding_dim
         )
         mask = attention_mask.bool()
         lengths = mask.sum(dim=1)
-        if original_prompt_lengths is None:
-            original_prompt_lengths = lengths
-        elif (
-            original_prompt_lengths.shape != lengths.shape
-            or original_prompt_lengths.device != lengths.device
-            or bool((original_prompt_lengths < lengths).any())
-        ):
-            raise ValueError("original_prompt_lengths must be [batch] and >= visible lengths")
+        batch, tokens, _ = embeddings.shape
+        hidden = self.config.hidden_dim
+        chunk_size = self.config.chunk_size
 
-        regions, valid = self._three_regions(embeddings, mask)
-        batch, _, width, _ = regions.shape
-        x = self.input_projection(regions.to(self.input_projection[0].weight.dtype))
-        positions = torch.arange(width, device=x.device)
-        region_ids = torch.arange(3, device=x.device)
-        x = x + self.position_embedding(positions)[None, None, :, :]
-        x = x + self.region_embedding(region_ids)[None, :, None, :]
+        x = self.input_projection(embeddings.to(self.input_projection[0].weight.dtype))
+        x = x + self._position_encoding(tokens, hidden, x.device, x.dtype)[None, :, :]
 
-        x = x.reshape(batch, 3 * width, self.config.hidden_dim)
-        flat_valid = valid.reshape(batch, 3 * width)
-        x = self.encoder(x, src_key_padding_mask=~flat_valid)
-        x = x.reshape(batch, 3, width, self.config.hidden_dim)
-        attention = self.pool_score(x).squeeze(-1).masked_fill(~valid, float("-inf"))
-        attention = attention.softmax(dim=-1)
-        pooled = (attention.unsqueeze(-1) * x).sum(dim=2).flatten(start_dim=1)
+        padding = (-tokens) % chunk_size
+        if padding:
+            x = F.pad(x, (0, 0, 0, padding))
+            mask = F.pad(mask, (0, padding), value=False)
+        chunk_count = x.shape[1] // chunk_size
+        local = x.reshape(batch * chunk_count, chunk_size, hidden)
+        local_valid = mask.reshape(batch * chunk_count, chunk_size)
+        active_chunks = local_valid.any(dim=1)
 
-        length_feature = torch.log1p(original_prompt_lengths.to(x.dtype)) / math.log1p(
+        # A short request can leave whole trailing chunks empty for other batch
+        # members. Give those chunks one dummy key to avoid all-masked softmax;
+        # discard their summaries immediately afterwards.
+        safe_local_valid = local_valid.clone()
+        safe_local_valid[:, 0] |= ~active_chunks
+        local = self.local_encoder(local, src_key_padding_mask=~safe_local_valid)
+        token_scores = self.token_pool_score(local).squeeze(-1)
+        token_weights = token_scores.masked_fill(~safe_local_valid, float("-inf")).softmax(-1)
+        chunks = (token_weights.unsqueeze(-1) * local).sum(dim=1)
+        chunks = chunks.masked_fill(~active_chunks[:, None], 0)
+        chunks = chunks.reshape(batch, chunk_count, hidden)
+        chunk_valid = active_chunks.reshape(batch, chunk_count)
+
+        chunks = chunks + self._position_encoding(
+            chunk_count, hidden, chunks.device, chunks.dtype
+        )[None, :, :]
+        chunks = self.global_encoder(chunks, src_key_padding_mask=~chunk_valid)
+        chunk_scores = self.chunk_pool_score(chunks).squeeze(-1)
+        chunk_weights = chunk_scores.masked_fill(~chunk_valid, float("-inf")).softmax(-1)
+        pooled = (chunk_weights.unsqueeze(-1) * chunks).sum(dim=1)
+
+        length_feature = torch.log1p(lengths.to(pooled.dtype)) / math.log1p(
             self.config.length_scale
         )
-        budget_feature = torch.log1p(max_new_tokens.to(x.dtype)) / math.log1p(
+        budget_feature = torch.log1p(max_new_tokens.to(pooled.dtype)) / math.log1p(
             self.config.generation_scale
         )
         features = torch.cat(

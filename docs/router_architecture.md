@@ -30,18 +30,15 @@ flowchart LR
 | `embeddings` | `[B,T,D]` | 同一冻结基础模型的 `embed_tokens` 输出；不是完整 LLM 的隐藏层输出 |
 | `attention_mask` | `[B,T]` | 1 为 prompt token，0 为右侧 padding；每行至少一个 token |
 | `max_new_tokens` | `[B]` | 请求在路由时可见的输出预算 |
-| `original_prompt_lengths` | `[B]`，可选 | 上游压缩过 prompt 时的原长度；压缩仍须保留首／中／尾信息 |
 
 **网络流水线**
 
-1. 对每条有效序列按原 token 次序取首段、中段、尾段，各不超过 `W=tokens_per_region` 个 token；短 prompt 的窗口可重叠。
-2. 用 `Linear(D,H)+LayerNorm` 将基础 embedding 投影到小维度 `H`。
-3. 加窗口内位置 embedding 和三段类型 embedding。
-4. 将三段拼成最多 `3W` 个位置，通过**两层小型 Transformer Encoder**。padding 作为 key mask；此模块属于 Router，不运行任何量化专家。
-5. 在每段内做可学习 attention pooling，得到三个 `[H]` 向量。
-6. 拼接三个向量、对数归一化的原 prompt 长度和 `max_new_tokens`，由 MLP 输出 `[B,M]` **raw logits**。
+1. **保留全部有效 token**，不做首／中／尾抽样，也不截断。用 `Linear(D,H)+LayerNorm` 将每个基础 embedding 投影到小维度 `H`，加入其绝对位置编码。
+2. 将完整 prompt 按顺序划为连续块，每块最多 `C=chunk_size` 个 token。**第一层小型 Transformer** 在每块内部做局部自注意力；每个真实 token 都参与。对每块做可学习注意力池化，得到一个摘要。
+3. 加入块位置编码，让所有非空块摘要通过**第二层小型 Transformer**，实现跨块信息交互。
+4. 对全部块摘要做注意力池化，拼接 prompt 长度与 `max_new_tokens` 的归一化数值特征，MLP 输出 `[B,M]` **raw logits**。
 
-当前示例配置为 `D=5120, H=256, W=128, heads=4, encoder_layers=2`。`D=5120` 与 Qwen3-14B 官方配置一致；其他值是架构起点，需在后续准确率和 Router 延迟实验中选择，不能当作已验证最优值。该结构的注意力长度至多 `3W=384`，与完整 8K prompt 长度分离。
+当前示例配置为 `D=5120, H=256, C=128, heads=4`，两层分别是局部 token 层和全局块层。`D=5120` 与 Qwen3-14B 官方配置一致；其他值是架构起点，需在后续准确率和 Router 延迟实验中选择，不能当作已验证最优值。8K prompt 会产生 64 个块摘要，**8192 个 token 全部参与**；它不是 8192 个 token 两层全局两两注意力。局部注意力复杂度约为 `O(T·C)`，块级注意力约为 `O((T/C)²)`，不含线性投影成本。
 
 **为什么不在网络内部做可用性 mask：**卡池状态变化比训练好的权重快。L1 网络始终给固定顺序的所有专家输出分数；在线层按注册表屏蔽无执行位置的专家。这样增加相同专家的副本不改变网络维度。
 
@@ -49,7 +46,7 @@ flowchart LR
 
 - Qwen3-14B Router 必须使用与其量化专家共同基础模型对应的冻结 embedding 表、相同 tokenizer 与 chat template；Qwen3-8B 另建 Router。不能混用不同基础模型的 token embeddings。
 - 本包刻意不加载 `embed_tokens`，以免把模型仓库格式、量化后端和路由网络耦合。后续 Gateway／embedding adapter 负责只加载或引用这一层，并在模型发布时校验来源版本。
-- 若为降低 embedding 开销，上游可先按首／中／尾规则选择 token ID，再查询 embedding 表，传入合并后的三个窗口及 `original_prompt_lengths`。这与传完整 embeddings 的语义须通过一致性测试；不可直接截断为仅前缀。
+- 上游必须为所有有效 prompt token 提供 embedding。当前架构版本 `full-token-hierarchical-v2` 与之前只抽样三个窗口的版本不兼容；未来训练的权重和配置必须带此版本号。
 - 路由网络的显存、提取 embeddings 的代价、TTFT 增量都应在后续系统实验实测。不要因为本结构参数较小，就假定完整路由链路没有显存或时延成本。
 
 ## 5. L2：注册表与动态池
@@ -63,7 +60,7 @@ flowchart LR
 ## 6. 已明确留给下一阶段的内容
 
 1. 对每位专家生成请求级 loss vector，确定 L1 损失与训练协议。
-2. 构建训练和开发数据，并评估三段表示与更简单的 mean pooling 等结构。
+2. 构建训练和开发数据，并评估块大小、完整序列 mean pooling 等结构消融。
 3. 冻结模型权重和 embedding 来源，发布 Router artifact。
 4. 接入 Gateway、vLLM 池、健康探针、排空与故障处理。
 5. 最后另行研究队列／容量调度；它可能改变 L2 规则及 L1/L2 的联合决策方式，但不属于当前架构代码。

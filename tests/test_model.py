@@ -22,14 +22,15 @@ class EmbeddingRouterTests(unittest.TestCase):
             embedding_dim=8,
             hidden_dim=16,
             num_heads=4,
-            tokens_per_region=3,
+            chunk_size=3,
             dropout=0,
         )
         self.model = EmbeddingRouter(self.config).eval()
 
     def test_default_has_two_transformer_layers(self) -> None:
         self.assertEqual(self.config.encoder_layers, 2)
-        self.assertEqual(len(self.model.encoder.layers), 2)
+        self.assertEqual(len(self.model.local_encoder.layers), 1)
+        self.assertEqual(len(self.model.global_encoder.layers), 1)
 
     def test_one_logit_vector_per_sequence_and_padding_invariance(self) -> None:
         embeddings = torch.randn(2, 7, 8)
@@ -47,20 +48,22 @@ class EmbeddingRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "right-padded"):
             self.model(torch.randn(1, 3, 8), torch.tensor([[1, 0, 1]]), torch.tensor([1]))
 
-    def test_three_regions_preserve_beginning_middle_and_end(self) -> None:
+    def test_every_valid_token_contributes_to_the_decision(self) -> None:
         config = RouterArchitecture(
             model_family="qwen3-14b",
             expert_ids=("awq-v1",),
-            embedding_dim=1,
+            embedding_dim=4,
             hidden_dim=8,
             num_heads=2,
-            tokens_per_region=2,
+            chunk_size=3,
+            dropout=0,
         )
-        model = EmbeddingRouter(config)
-        values = torch.arange(9, dtype=torch.float32).view(1, 9, 1)
-        regions, valid = model._three_regions(values, torch.ones(1, 9, dtype=torch.bool))
-        self.assertTrue(bool(valid.all()))
-        self.assertEqual(regions[0, :, :, 0].tolist(), [[0, 1], [3, 4], [7, 8]])
+        model = EmbeddingRouter(config).eval()
+        embeddings = torch.randn(1, 17, 4, requires_grad=True)
+        logits = model(embeddings, torch.ones(1, 17), torch.tensor([12]))
+        logits.sum().backward()
+        self.assertEqual(logits.shape, (1, 1))
+        self.assertTrue(bool((embeddings.grad.abs().sum(dim=-1) > 0).all()))
 
     def test_two_stage_route_masks_unavailable_expert(self) -> None:
         # Force a stable rank: int8 > gptq > awq; only gptq is READY.

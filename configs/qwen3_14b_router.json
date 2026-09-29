@@ -9,7 +9,7 @@
   "embedding_dim": 5120,
   "hidden_dim": 256,
   "num_heads": 4,
-  "encoder_layers": 1,
+  "encoder_layers": 2,
   "tokens_per_region": 128,
   "dropout": 0.1,
   "length_scale": 8192,

@@ -12,7 +12,7 @@ frozen base-model token embeddings [B, T, D]
              |
              v
 L1 quality router: first / middle / last prompt windows
-             -> projection -> one lightweight Transformer encoder
+             -> projection -> two lightweight Transformer encoder layers
              -> attention pooling per window -> M expert logits
              |
              v
@@ -65,7 +65,7 @@ prefill and decode routing. There is no teacher model or queue-price objective.
 
 The module selects up to `tokens_per_region` tokens from the beginning, center
 and end of each prompt, projects to `hidden_dim`, adds local position and region
-embeddings, runs one small Transformer encoder, attention-pools each region,
+embeddings, runs two small Transformer encoder layers, attention-pools each region,
 then emits `[B, M]` **raw logits**. There is no softmax or availability masking
 inside the neural network: the registry changes independently of its weights.
 

@@ -15,7 +15,7 @@ class RouterArchitecture:
     architecture_version: str = "embedding-router-v1"
     hidden_dim: int = 256
     num_heads: int = 4
-    encoder_layers: int = 1
+    encoder_layers: int = 2
     tokens_per_region: int = 128
     dropout: float = 0.1
     length_scale: int = 8192

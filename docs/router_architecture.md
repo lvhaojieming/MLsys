@@ -37,11 +37,11 @@ flowchart LR
 1. 对每条有效序列按原 token 次序取首段、中段、尾段，各不超过 `W=tokens_per_region` 个 token；短 prompt 的窗口可重叠。
 2. 用 `Linear(D,H)+LayerNorm` 将基础 embedding 投影到小维度 `H`。
 3. 加窗口内位置 embedding 和三段类型 embedding。
-4. 将三段拼成最多 `3W` 个位置，通过一层小型 Transformer encoder。padding 作为 key mask；此模块属于 Router，不运行任何量化专家。
+4. 将三段拼成最多 `3W` 个位置，通过**两层小型 Transformer Encoder**。padding 作为 key mask；此模块属于 Router，不运行任何量化专家。
 5. 在每段内做可学习 attention pooling，得到三个 `[H]` 向量。
 6. 拼接三个向量、对数归一化的原 prompt 长度和 `max_new_tokens`，由 MLP 输出 `[B,M]` **raw logits**。
 
-当前示例配置为 `D=5120, H=256, W=128, heads=4, encoder_layers=1`。`D=5120` 与 Qwen3-14B 官方配置一致；其他值是架构起点，需在后续准确率和 Router 延迟实验中选择，不能当作已验证最优值。该结构的注意力长度至多 `3W=384`，与完整 8K prompt 长度分离。
+当前示例配置为 `D=5120, H=256, W=128, heads=4, encoder_layers=2`。`D=5120` 与 Qwen3-14B 官方配置一致；其他值是架构起点，需在后续准确率和 Router 延迟实验中选择，不能当作已验证最优值。该结构的注意力长度至多 `3W=384`，与完整 8K prompt 长度分离。
 
 **为什么不在网络内部做可用性 mask：**卡池状态变化比训练好的权重快。L1 网络始终给固定顺序的所有专家输出分数；在线层按注册表屏蔽无执行位置的专家。这样增加相同专家的副本不改变网络维度。
 

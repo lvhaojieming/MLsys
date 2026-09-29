@@ -27,6 +27,10 @@ class EmbeddingRouterTests(unittest.TestCase):
         )
         self.model = EmbeddingRouter(self.config).eval()
 
+    def test_default_has_two_transformer_layers(self) -> None:
+        self.assertEqual(self.config.encoder_layers, 2)
+        self.assertEqual(len(self.model.encoder.layers), 2)
+
     def test_one_logit_vector_per_sequence_and_padding_invariance(self) -> None:
         embeddings = torch.randn(2, 7, 8)
         mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1]])

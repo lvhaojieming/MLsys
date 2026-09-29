@@ -1,0 +1,17 @@
+{
+  "model_family": "qwen3-14b",
+  "architecture_version": "embedding-router-v1",
+  "expert_ids": [
+    "qwen3-14b/awq-w4a16/v1",
+    "qwen3-14b/gptq-w4a16/v1",
+    "qwen3-14b/int8-w8a8/v1"
+  ],
+  "embedding_dim": 5120,
+  "hidden_dim": 256,
+  "num_heads": 4,
+  "encoder_layers": 1,
+  "tokens_per_region": 128,
+  "dropout": 0.1,
+  "length_scale": 8192,
+  "generation_scale": 2048
+}

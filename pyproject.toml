@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moqe-router"
+version = "0.1.0"
+description = "Sequence-level two-stage router for heterogeneous quantized LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy>=1.26"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

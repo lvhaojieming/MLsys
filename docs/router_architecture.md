@@ -1,8 +1,8 @@
-# Router 架构定稿（只含结构，不含训练）
+# Router 架构与训练边界
 
 ## 1. 本阶段边界
 
-本阶段只实现从**冻结的基础模型 token embedding 输出**到路由决策的数据路径。不实现专家 loss 标注、损失函数、训练脚本、Gateway、vLLM 请求代理或容量感知调度。当前网络随机初始化，不能直接用于真实专家选择。
+架构实现从**冻结的基础模型 token embedding 输出**到路由决策的数据路径。仓库现提供离线监督训练脚本，输入是每位专家在同一参考续写上的请求级 loss。专家 loss 标注的生成、Gateway、vLLM 请求代理和容量感知调度尚未实现。示例网络随机初始化，必须训练和评估后才能用于真实专家选择。
 
 ## 2. 两级职责
 
@@ -45,9 +45,15 @@ flowchart LR
 ## 4. embedding 来源与部署约束
 
 - Qwen3-14B Router 必须使用与其量化专家共同基础模型对应的冻结 embedding 表、相同 tokenizer 与 chat template；Qwen3-8B 另建 Router。不能混用不同基础模型的 token embeddings。
-- 本包刻意不加载 `embed_tokens`，以免把模型仓库格式、量化后端和路由网络耦合。后续 Gateway／embedding adapter 负责只加载或引用这一层，并在模型发布时校验来源版本。
+- 离线训练只从 safetensors 加载 `model.embed_tokens.weight`，不构造完整 Causal LM，也不运行任何量化 expert。在线 embedding adapter 仍属于后续 serving 阶段。
 - 上游必须为所有有效 prompt token 提供 embedding。当前架构版本 `full-token-hierarchical-v2` 与之前只抽样三个窗口的版本不兼容；未来训练的权重和配置必须带此版本号。
 - 路由网络的显存、提取 embeddings 的代价、TTFT 增量都应在后续系统实验实测。不要因为本结构参数较小，就假定完整路由链路没有显存或时延成本。
+
+所有候选 expert 都是同一基础模型的完整量化变体。当前 prototype 的部署语义是：
+
+> Each quantized expert is a complete quantized variant of the same base model and is currently assumed to occupy one dedicated GPU.
+
+即 `one quantized expert ↔ one dedicated GPU`。这是当前部署假设，不属于 Router training 的职责；训练代码只学习 `request → quantized expert`，不管理 expert 与 GPU 的映射。
 
 ## 5. L2：注册表与动态池
 
@@ -59,8 +65,7 @@ flowchart LR
 
 ## 6. 已明确留给下一阶段的内容
 
-1. 对每位专家生成请求级 loss vector，确定 L1 损失与训练协议。
-2. 构建训练和开发数据，并评估块大小、完整序列 mean pooling 等结构消融。
-3. 冻结模型权重和 embedding 来源，发布 Router artifact。
-4. 接入 Gateway、vLLM 池、健康探针、排空与故障处理。
-5. 最后另行研究队列／容量调度；它可能改变 L2 规则及 L1/L2 的联合决策方式，但不属于当前架构代码。
+1. 对每位专家生成请求级 loss vector，构建训练与开发数据，并评估块大小、完整序列 mean pooling 等结构消融。
+2. 将训练好的 Router artifact 和固定的 embedding、tokenizer 来源一起发布。
+3. 接入 Gateway、vLLM 池、健康探针、排空与故障处理。
+4. 最后另行研究队列／容量调度；它可能改变 L2 规则及 L1/L2 的联合决策方式，但不属于当前架构代码。

@@ -1,4 +1,4 @@
-"""MoQE routing primitives. Embedding extraction and model serving live upstream."""
+"""MoQE Router architecture, offline training, and routing primitives."""
 
 from .config import RouterArchitecture
 from .physical import PoolRegistry, Replica, ReplicaState, RouteUnavailable

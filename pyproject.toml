@@ -11,7 +11,11 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.3"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "numpy>=1.26"]
+test = ["pytest>=8", "numpy>=1.26", "safetensors>=0.4"]
+train = ["safetensors>=0.4"]
+
+[project.scripts]
+moqe-train = "moqe_router.training.trainer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

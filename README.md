@@ -1,9 +1,8 @@
 # MLsys: MoQE routing foundation
 
-This repository currently implements the **routing architecture only**. It does
-not include a trained checkpoint, a loss function, a training pipeline, a vLLM
-gateway, or capacity-aware scheduling. Those pieces will be added after the
-architecture and expert inventory are fixed.
+This repository implements the routing architecture and an offline supervised
+training pipeline. It does not include a trained checkpoint, expert-loss data
+generation, a vLLM gateway, or capacity-aware scheduling.
 
 ## Routing contract
 
@@ -28,9 +27,10 @@ one request remains on this expert + replica for all prefill and decode
 
 L1 produces **one logit vector per entire request**, never per-token decisions.
 It uses all prompt embeddings, prompt length and the caller's output budget.
-The base embedding layer stays outside this package and should be frozen. The
-config's ordered `expert_ids` defines the exact output-head order. A different
-base model, such as Qwen3-8B, needs a separate config and router.
+The base embedding layer stays outside the Router network and is frozen during
+training. The config's ordered `expert_ids` defines the exact output-head
+order. A different base model, such as Qwen3-8B, needs a separate config and
+router.
 
 L2 is rule-based in this version: it filters by model family, expert, `READY`
 state and context limit, then round-robins over pools and replicas. It never
@@ -50,6 +50,8 @@ prefill and decode routing. There is no teacher model or queue-price objective.
 | `src/moqe_router/model.py` | Post-embedding L1 network returning raw expert logits |
 | `src/moqe_router/physical.py` | Atomic pool snapshots and L2 placement |
 | `src/moqe_router/routing.py` | Compose L1 and L2 for one request |
+| `src/moqe_router/training/` | Data, frozen embedding, objective, metrics, and single-GPU trainer |
+| `scripts/train_router.py` | Training CLI |
 | `configs/qwen3_14b_router.json` | Illustrative architecture config; check `embedding_dim` against the exact base checkpoint |
 
 ## Model input
@@ -86,9 +88,41 @@ with torch.inference_mode():
     logits = router(embeddings, attention_mask, max_new_tokens)
 ```
 
-The example architecture has randomly initialized weights. **Its rankings are
-not useful until a later training stage is implemented.** Do not put this model
-on live traffic yet.
+The example architecture has randomly initialized weights. Train and evaluate
+it on your actual expert inventory before using its rankings on live traffic.
+
+## Train the quality router
+
+Install the training dependencies with `python -m pip install -e '.[train,test]'`.
+Prepare separate train and validation JSONL files. Each line is one request;
+the loss list follows `RouterArchitecture.expert_ids` exactly:
+
+```json
+{"id":"sample-1","input_ids":[151644,872,198],"max_new_tokens":128,"expert_losses":[1.42,1.31,1.28]}
+```
+
+`input_ids` must be the **complete prompt** tokenized with the same tokenizer
+and chat template as the base model. Measure every expert's loss on the same
+reference continuation, using mean target-token negative log-likelihood.
+Lower loss means better quality. Keep evaluation requests separate
+from training requests. The repository does not yet generate these labels.
+
+The base model directory must contain `model.safetensors` or
+`model.safetensors.index.json` and the shard containing
+`model.embed_tokens.weight`. The trainer loads only that tensor on CPU and
+keeps it frozen. It never loads quantized expert models; only router parameters
+enter the optimizer. The loss is cross entropy against a soft distribution
+built from per-request relative expert losses.
+
+```bash
+python scripts/train_router.py \
+  --config configs/qwen3_14b_router_train.json
+```
+
+The output contains `metrics.jsonl`, `checkpoint_best.pt`, and
+`checkpoint_last.pt`. The best checkpoint uses the lowest validation mean
+routing regret. See `docs/router_training.md` for the complete contract and
+resume command.
 
 ## Registry lifecycle boundary
 

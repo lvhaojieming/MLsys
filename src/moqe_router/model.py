@@ -76,6 +76,14 @@ class EmbeddingRouter(nn.Module):
             raise ValueError("all inputs must be on the same device")
         if not torch.is_floating_point(embeddings):
             raise ValueError("embeddings must be floating point")
+        if max_new_tokens.dtype not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError("max_new_tokens must have an integer dtype")
         if bool(((attention_mask != 0) & (attention_mask != 1)).any()):
             raise ValueError("attention_mask values must be 0 or 1")
         mask = attention_mask.bool()

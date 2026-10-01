@@ -105,7 +105,20 @@ the loss list follows `RouterArchitecture.expert_ids` exactly:
 and chat template as the base model. Measure every expert's loss on the same
 reference continuation, using mean target-token negative log-likelihood.
 Lower loss means better quality. Keep evaluation requests separate
-from training requests. The repository does not yet generate these labels.
+from training requests. The local expert services compute these labels from
+the same reference token IDs for both experts.
+
+For cleaning local WildChat, GSM8K, Magicoder and LongAlign downloads into
+deduplicated request/reference splits, see [data preparation](docs/data_preparation.md).
+The cleaning scripts preserve complete prompts, enforce token limits and prepare
+request/reference inputs for paired expert NLL computation.
+For stricter content screening and complete-context local quality review, see
+[high-quality cleaning](docs/high_quality_cleaning.md). This curation stage
+produces request/reference data and deliberately defers expert labels and training.
+To compute actual AWQ/GPTQ target losses and update the Router as paired losses
+arrive on the curated v2 data, with experts on separate GPUs,
+run `bash scripts/train_router_hq.sh`; see
+[two-GPU training and inference](docs/two_gpu_router_training.md).
 
 The base model directory must contain `model.safetensors` or
 `model.safetensors.index.json` and the shard containing

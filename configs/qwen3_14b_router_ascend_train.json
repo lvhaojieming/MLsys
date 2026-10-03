@@ -1,0 +1,23 @@
+{
+  "architecture_config": "configs/qwen3_14b_router_two_experts.json",
+  "train_data": "/workspace/zhangjinhao/router-data/labeled/train.jsonl",
+  "valid_data": "/workspace/zhangjinhao/router-data/labeled/valid.jsonl",
+  "base_model_path": "/workspace/zhangjinhao/router-base-embedding",
+  "embedding_weight_key": "model.embed_tokens.weight",
+  "output_dir": "/workspace/zhangjinhao/router-training/qwen3-14b-ddp",
+  "seed": 42,
+  "epochs": 10,
+  "batch_size": 2,
+  "lr": 0.0001,
+  "betas": [0.9, 0.95],
+  "eps": 1e-8,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.05,
+  "min_lr_ratio": 0.1,
+  "max_grad_norm": 1.0,
+  "temperature": 0.1,
+  "precision": "bf16",
+  "num_workers": 2,
+  "pin_memory": false,
+  "max_prompt_tokens": 8192
+}

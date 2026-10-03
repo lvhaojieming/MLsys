@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${NODE_RANK:?Set NODE_RANK to 0, 1 or 2}"
+: "${NODE_RANK:?Set NODE_RANK to 0 or 1}"
 : "${TRAIN_CONFIG:?Set TRAIN_CONFIG to the training JSON path}"
 : "${MASTER_ADDR:=10.107.206.213}"
 : "${MASTER_PORT:=29613}"
-: "${NNODES:=3}"
+: "${NNODES:=2}"
 : "${NPROC_PER_NODE:=8}"
 : "${HCCL_SOCKET_IFNAME:=enp61s0f0}"
 source /usr/local/Ascend/ascend-toolkit/set_env.sh

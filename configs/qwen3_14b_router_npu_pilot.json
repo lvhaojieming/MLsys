@@ -1,13 +1,13 @@
 {
   "architecture_config": "configs/qwen3_14b_router_two_experts.json",
-  "train_data": "/workspace/zhangjinhao/router-data/labeled/train.jsonl",
-  "valid_data": "/workspace/zhangjinhao/router-data/labeled/valid.jsonl",
+  "train_data": "/workspace/zhangjinhao/router-data/pilot-gap/requests.jsonl",
+  "valid_data": "/workspace/zhangjinhao/router-data/pilot-gap/requests.jsonl",
   "base_model_path": "/workspace/zhangjinhao/router-base-embedding",
   "embedding_weight_key": "model.embed_tokens.weight",
-  "output_dir": "/workspace/zhangjinhao/router-training/qwen3-14b-ddp",
+  "output_dir": "/workspace/zhangjinhao/router-training/gap-pilot-1024",
   "seed": 42,
   "epochs": 1,
-  "batch_size": 2,
+  "batch_size": 4,
   "lr": 0.0001,
   "betas": [
     0.9,
@@ -20,9 +20,9 @@
   "max_grad_norm": 1.0,
   "temperature": 0.1,
   "precision": "bf16",
-  "num_workers": 2,
+  "num_workers": 0,
   "pin_memory": false,
-  "max_prompt_tokens": 8192,
+  "max_prompt_tokens": 12288,
   "gap_alpha": 2.0,
   "gap_scale": 0.1
 }

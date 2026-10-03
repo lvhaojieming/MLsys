@@ -19,7 +19,7 @@ from ..config import RouterArchitecture
 from ..model import EmbeddingRouter
 from .data import RequestDataset, collate_requests
 from .embedding import FrozenEmbeddingProvider
-from .objective import build_loss_aware_targets
+from .objective import build_loss_aware_targets, gap_weighted_terms
 from .trainer import TrainingConfig, build_scheduler, save_checkpoint, load_checkpoint, _move_batch, _log_record
 
 
@@ -109,7 +109,8 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                              batch_per_rank=config.batch_size, global_batch_size=config.batch_size * world,
                              train_samples=len(datasets[0]), validation_samples=len(datasets[1]),
                              sampler_padding_samples=len(sampler) * world - len(datasets[0]),
-                             frozen_embedding=True, loss="sequence_level_soft_target_cross_entropy"), metrics)
+                             frozen_embedding=True, loss="gap_weighted_sequence_soft_target_cross_entropy",
+                             gap_alpha=config.gap_alpha, gap_scale=config.gap_scale), metrics)
         for epoch in range(epoch_done + 1, config.epochs + 1):
             sampler.set_epoch(epoch)
             seed(config.seed + epoch * world + rank)
@@ -121,7 +122,12 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                 vectors = embedding(ids)
                 with torch.autocast(device_type=device_kind, dtype=torch.bfloat16):
                     logits = ddp(vectors, mask, budget)
-                loss = -(targets * F.log_softmax(logits.float(), dim=-1)).sum(-1).mean()
+                ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
+                weight_total = weights.sum().detach()
+                dist.all_reduce(weight_total)
+                numerator = (ce * weights).sum()
+                # DDP averages gradients: compensate to obtain a global weighted mean.
+                loss = numerator * world / weight_total
                 finite = torch.isfinite(loss).to(torch.int32)
                 dist.all_reduce(finite, op=dist.ReduceOp.MIN)
                 if not finite.item():
@@ -133,23 +139,23 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                 optimizer.step()
                 scheduler.step()
                 step += 1
-                total = torch.stack((loss.detach() * ids.shape[0], loss.new_tensor(ids.shape[0])))
+                total = torch.stack((numerator.detach(), weights.sum()))
                 dist.all_reduce(total)
                 if rank == 0:
                     _log_record(dict(epoch=epoch, step=step, split="train", loss=(total[0]/total[1]).item(),
                                      lr=optimizer.param_groups[0]["lr"], grad_norm=norm.item()), metrics)
             router.eval()
-            totals = torch.zeros(4, device=device, dtype=torch.float32)
+            totals = torch.zeros(5, device=device, dtype=torch.float32)
             with torch.inference_mode():
                 for batch in valid_loader:
                     _, ids, mask, budget, losses = _move_batch(batch, device)
                     with torch.autocast(device_type=device_kind, dtype=torch.bfloat16):
                         logits = router(embedding(ids), mask, budget)
-                    ce = -(build_loss_aware_targets(losses, config.temperature) *
-                           F.log_softmax(logits.float(), dim=-1)).sum(-1)
+                    ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
                     selected = logits.argmax(-1)
                     oracle = losses.min(-1)
-                    totals[0] += ce.sum()
+                    totals[0] += (ce * weights).sum()
+                    totals[4] += weights.sum()
                     totals[1] += (selected == oracle.indices).sum()
                     totals[2] += (losses.gather(1, selected[:, None]).squeeze(1) - oracle.values).sum()
                     totals[3] += ids.shape[0]
@@ -160,7 +166,7 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
             improved = regret < best
             best = min(best, regret)
             if rank == 0:
-                _log_record(dict(epoch=epoch, split="valid", loss=(totals[0]/totals[3]).item(),
+                _log_record(dict(epoch=epoch, split="valid", loss=(totals[0]/totals[4]).item(),
                                  top1_accuracy=(totals[1]/totals[3]).item(), mean_routing_regret=regret,
                                  sample_count=int(totals[3].item())), metrics)
                 args = dict(router=router, optimizer=optimizer, scheduler=scheduler, epoch=epoch,

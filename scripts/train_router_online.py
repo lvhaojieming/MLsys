@@ -55,7 +55,7 @@ def train_online(deployment_path,config_path,resume=None,pilot=False):
     from moqe_router.model import EmbeddingRouter
     from moqe_router.training.embedding import FrozenEmbeddingProvider
     from moqe_router.training.metrics import routing_metrics
-    from moqe_router.training.objective import build_loss_aware_targets
+    from moqe_router.training.objective import build_loss_aware_targets, gap_weighted_router_loss
     from moqe_router.training.online_losses import PairedExpertLossCache,prefetched_batches
     from moqe_router.training.trainer import (TrainingConfig,build_scheduler,save_checkpoint,load_checkpoint,
                                             _finite_or_raise,_move_batch,_log_record,_require_bf16_cuda,validate)
@@ -110,7 +110,7 @@ def train_online(deployment_path,config_path,resume=None,pilot=False):
                 with torch.no_grad(): vectors=embedding(input_ids)
                 with torch.autocast('cuda',dtype=torch.bfloat16):
                     logits=router(vectors,mask,budget)
-                    loss=-(targets*F.log_softmax(logits,dim=-1)).sum(-1).mean()
+                    loss=gap_weighted_router_loss(logits,losses,config.temperature,config.gap_alpha,config.gap_scale)
                 for name,value in (('expert_losses',losses),('router_logits',logits),('router_loss',loss)):
                     _finite_or_raise(name,value,epoch=epoch,sample_ids=sample_ids,loss=loss)
                 loss.backward(); grad=torch.nn.utils.clip_grad_norm_(router.parameters(),config.max_grad_norm)
@@ -123,7 +123,8 @@ def train_online(deployment_path,config_path,resume=None,pilot=False):
                              'grad_norm':float(grad.detach().float().cpu()),'sample_ids':sample_ids},metrics)
             assert trained==len(rows['train'])
             valid=validate(router,embedding,prefetched_batches(rows['valid'],cache,config.batch_size),
-                           device=device,temperature=config.temperature,epoch=epoch)
+                           device=device,temperature=config.temperature,epoch=epoch,
+                           gap_alpha=config.gap_alpha,gap_scale=config.gap_scale)
             _log_record(valid,metrics); regret=float(valid['mean_routing_regret'])
             if regret<best_regret:
                 best_regret=regret

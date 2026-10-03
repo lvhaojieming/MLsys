@@ -22,7 +22,7 @@ from ..model import EmbeddingRouter
 from .data import RequestDataset, collate_requests
 from .embedding import FrozenEmbeddingProvider
 from .metrics import routing_metrics
-from .objective import build_loss_aware_targets
+from .objective import build_loss_aware_targets, gap_weighted_router_loss, gap_weighted_terms
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,8 @@ class TrainingConfig:
     num_workers: int
     pin_memory: bool
     max_prompt_tokens: int
+    gap_alpha: float = 2.0
+    gap_scale: float = 0.1
 
     def __post_init__(self) -> None:
         if not all(
@@ -74,6 +76,10 @@ class TrainingConfig:
             raise ValueError("max_prompt_tokens must be a positive integer")
         if type(self.pin_memory) is not bool:
             raise ValueError("pin_memory must be boolean")
+        if not math.isfinite(self.gap_alpha) or self.gap_alpha < 0:
+            raise ValueError("gap_alpha must be finite and nonnegative")
+        if not math.isfinite(self.gap_scale) or self.gap_scale <= 0:
+            raise ValueError("gap_scale must be finite and positive")
         if self.precision != "bf16":
             raise ValueError("precision must be 'bf16'")
         if len(self.betas) != 2 or not all(0 <= beta < 1 for beta in self.betas):
@@ -232,9 +238,12 @@ def validate(
     device: torch.device,
     temperature: float,
     epoch: int,
+    gap_alpha: float = 2.0,
+    gap_scale: float = 0.1,
 ) -> dict[str, float | int | str]:
     router.eval()
     loss_sum = 0.0
+    weight_sum = 0.0
     correct = 0
     regret_sum = 0.0
     sample_count = 0
@@ -261,15 +270,16 @@ def validate(
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = router(embeddings, attention_mask, max_new_tokens)
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = -(target_probs * log_probs).sum(dim=-1).mean()
+                ce, weights = gap_weighted_terms(logits, expert_losses, temperature, gap_alpha, gap_scale)
+                loss = (ce * weights).sum() / weights.sum()
             _finite_or_raise(
                 "logits", logits, epoch=epoch, sample_ids=sample_ids, loss=loss
             )
             _finite_or_raise("loss", loss, epoch=epoch, sample_ids=sample_ids, loss=loss)
             metrics = routing_metrics(logits, expert_losses)
             batch_size = metrics.sample_count
-            loss_sum += float(loss.float().cpu()) * batch_size
+            loss_sum += float((ce * weights).sum().cpu())
+            weight_sum += float(weights.sum().cpu())
             correct += metrics.top1_correct
             regret_sum += metrics.routing_regret_sum
             sample_count += batch_size
@@ -277,7 +287,7 @@ def validate(
     return {
         "epoch": epoch,
         "split": "valid",
-        "loss": loss_sum / sample_count,
+        "loss": loss_sum / weight_sum,
         "top1_accuracy": correct / sample_count,
         "mean_routing_regret": regret_sum / sample_count,
     }
@@ -410,8 +420,7 @@ def train(training_config: TrainingConfig, resume: str | Path | None = None) -> 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = router(embeddings, attention_mask, max_new_tokens)
-                log_probs = F.log_softmax(logits, dim=-1)
-                loss = -(target_probs * log_probs).sum(dim=-1).mean()
+                loss = gap_weighted_router_loss(logits, expert_losses, training_config.temperature, training_config.gap_alpha, training_config.gap_scale)
             _finite_or_raise(
                 "logits", logits, epoch=epoch, sample_ids=sample_ids, loss=loss
             )
@@ -448,6 +457,7 @@ def train(training_config: TrainingConfig, resume: str | Path | None = None) -> 
             valid_loader,
             device=device,
             temperature=training_config.temperature,
+            gap_alpha=training_config.gap_alpha, gap_scale=training_config.gap_scale,
             epoch=epoch,
         )
         _log_record(validation, metrics_path)

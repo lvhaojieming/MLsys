@@ -29,3 +29,21 @@ def test_alpha_zero_is_unweighted_and_order_invariant():
 def test_invalid_weight_configuration(alpha, scale):
     with pytest.raises(ValueError):
         gap_weighted_router_loss(torch.zeros(2, 2), torch.ones(2, 2), alpha=alpha, gap_scale=scale)
+
+
+def test_ddp_weighted_gradient_matches_global_batch_with_unequal_shards():
+    torch.manual_seed(42)
+    inputs = torch.randn(16, 4)
+    experts = torch.rand(16, 2) * 3
+    parameter = torch.randn(4, 2, requires_grad=True)
+    reference = gap_weighted_router_loss(inputs @ parameter, experts)
+    expected, = torch.autograd.grad(reference, parameter)
+    _, all_weights = gap_weighted_terms(inputs @ parameter, experts, .1)
+    gradients = []
+    for rank in range(6):
+        logits = inputs[rank::6] @ parameter
+        ce, weights = gap_weighted_terms(logits, experts[rank::6], .1)
+        local_loss = 6 * (ce * weights).sum() / all_weights.sum()
+        gradient, = torch.autograd.grad(local_loss, parameter)
+        gradients.append(gradient)
+    assert torch.allclose(torch.stack(gradients).mean(0), expected, atol=1e-6)

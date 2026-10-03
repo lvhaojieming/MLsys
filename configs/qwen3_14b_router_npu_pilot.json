@@ -4,10 +4,10 @@
   "valid_data": "/workspace/zhangjinhao/router-data/pilot-gap/requests.jsonl",
   "base_model_path": "/workspace/zhangjinhao/router-base-embedding",
   "embedding_weight_key": "model.embed_tokens.weight",
-  "output_dir": "/workspace/zhangjinhao/router-training/gap-pilot-1024-six-nodes",
+  "output_dir": "/workspace/zhangjinhao/router-training/gap-pilot-1024-48-scorers-ddp6",
   "seed": 42,
   "epochs": 1,
-  "batch_size": 4,
+  "batch_size": 8,
   "lr": 0.0001,
   "betas": [
     0.9,

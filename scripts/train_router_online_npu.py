@@ -27,8 +27,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--requests', required=True)
-    parser.add_argument('--awq-url', required=True)
-    parser.add_argument('--gptq-url', required=True)
+    parser.add_argument('--awq-url', nargs='+', required=True)
+    parser.add_argument('--gptq-url', nargs='+', required=True)
+    parser.add_argument('--loss-cache', help='Optional previously computed paired loss cache')
     args = parser.parse_args()
     config = TrainingConfig.from_json(args.config)
     if config.epochs != 1:
@@ -70,13 +71,23 @@ def main():
             h.update(tensor.detach().cpu().contiguous().numpy().tobytes())
         return h.hexdigest()
     before = digest(router)
-    urls = [args.awq_url.rstrip('/'), args.gptq_url.rstrip('/')]
+    pools = [[url.rstrip('/') for url in args.awq_url], [url.rstrip('/') for url in args.gptq_url]]
     expected_names = ['moqe-qwen3-awq', 'moqe-qwen3-gptq']
-    for url, expected in zip(urls, expected_names):
-        with urllib.request.urlopen(url+'/v1/models', timeout=30) as response:
-            available = [m['id'] for m in json.load(response)['data']]
-        if expected not in available:
-            raise ValueError(f'expert identity mismatch: {url}: {available}')
+    for pool, expected in zip(pools, expected_names):
+        for url in pool:
+            with urllib.request.urlopen(url+'/v1/models', timeout=30) as response:
+                available = [m['id'] for m in json.load(response)['data']]
+            if expected not in available:
+                raise ValueError(f'expert identity mismatch: {url}: {available}')
+    cache = {}
+    if args.loss_cache:
+        for line in Path(args.loss_cache).read_text().splitlines():
+            value = json.loads(line)
+            if value['expert_ids'] != list(architecture.expert_ids):
+                raise ValueError('cached expert order mismatch')
+            if len(value['expert_losses']) != 2 or not all(math.isfinite(x) for x in value['expert_losses']):
+                raise ValueError('invalid cached expert losses')
+            cache[value['id']] = value
     def score(url, name, row):
         ids = row['input_ids'] + row['target_ids']
         payload = dict(model=name, prompt=ids, max_tokens=1, temperature=0, seed=42,
@@ -94,15 +105,26 @@ def main():
         if len(values) != len(row['target_ids']) or not values or not all(v is not None and math.isfinite(v) for v in values):
             raise ValueError('invalid reference token log probabilities')
         return -sum(values)/len(values)
+    def token_hash(row):
+        return hashlib.sha256(json.dumps(row['input_ids']+row['target_ids']).encode()).hexdigest()
     def paired(batch):
+        pending = {}
+        for row in batch:
+            cached = cache.get(row['id'])
+            if cached:
+                if cached['tokens_sha256'] != token_hash(row) or cached['target_tokens'] != len(row['target_ids']):
+                    raise ValueError('cached loss belongs to different tokens')
+                continue
+            placement = int(hashlib.sha256(row['id'].encode()).hexdigest()[:16], 16)
+            pending[row['id']] = [score_pool.submit(score, pool[placement % len(pool)], name, row)
+                                  for pool, name in zip(pools, expected_names)]
         examples = []
         for row in batch:
-            futures = [score_pool.submit(score, url, name, row) for url, name in zip(urls, expected_names)]
-            losses = [f.result() for f in futures]
+            losses = cache[row['id']]['expert_losses'] if row['id'] in cache else [f.result() for f in pending[row['id']]]
             with (output/'expert-loss-cache.jsonl').open('a') as f:
                 f.write(json.dumps(dict(id=row['id'], expert_ids=architecture.expert_ids,
                     expert_losses=losses, target_tokens=len(row['target_ids']),
-                    tokens_sha256=hashlib.sha256(json.dumps(row['input_ids']+row['target_ids']).encode()).hexdigest()))+'\n')
+                    tokens_sha256=token_hash(row)))+'\n')
             examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'], tuple(losses)))
         return collate_requests(examples)
     def batches(data):
@@ -116,8 +138,9 @@ def main():
     record(stage='started', epochs=1, device='npu', train_samples=len(train), validation_samples=len(valid),
            expert_ids=architecture.expert_ids, loss='gap_weighted_sequence_soft_target_cross_entropy',
            tau=config.temperature, alpha=config.gap_alpha, gap_scale=config.gap_scale,
-           frozen_embedding=True, full_prompt=True, synthetic=False)
-    with ThreadPoolExecutor(max_workers=2) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
+           frozen_embedding=True, full_prompt=True, synthetic=False,
+           scoring_pools=pools, cached_samples=len(cache))
+    with ThreadPoolExecutor(max_workers=sum(map(len, pools))) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
         router.train()
         seen, step = 0, 0
         for batch in batches(train):

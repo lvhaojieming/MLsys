@@ -50,6 +50,7 @@ class TrainingConfig:
     max_prompt_tokens: int
     gap_alpha: float = 2.0
     gap_scale: float = 0.1
+    validation_interval_steps: int = 5000
 
     def __post_init__(self) -> None:
         if not all(
@@ -72,6 +73,8 @@ class TrainingConfig:
             raise ValueError("batch_size must be a positive integer")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a nonnegative integer")
+        if type(self.validation_interval_steps) is not int or self.validation_interval_steps < 1:
+            raise ValueError("validation_interval_steps must be a positive integer")
         if type(self.max_prompt_tokens) is not int or self.max_prompt_tokens < 1:
             raise ValueError("max_prompt_tokens must be a positive integer")
         if type(self.pin_memory) is not bool:

@@ -24,5 +24,6 @@
   "pin_memory": false,
   "max_prompt_tokens": 12288,
   "gap_alpha": 2.0,
-  "gap_scale": 0.1
+  "gap_scale": 0.1,
+  "validation_interval_steps": 5000
 }

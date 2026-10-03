@@ -24,6 +24,7 @@ from moqe_router.model import EmbeddingRouter
 from moqe_router.training.data import TrainingExample, collate_requests
 from moqe_router.training.embedding import FrozenEmbeddingProvider
 from moqe_router.training.objective import gap_weighted_terms
+from moqe_router.training.checkpoint_policy import BestCheckpointPolicy
 from moqe_router.training.trainer import TrainingConfig, build_scheduler, save_checkpoint
 
 
@@ -146,10 +147,13 @@ def main():
         examples = []
         for row in batch:
             losses = cache[row['id']]['expert_losses'] if row['id'] in cache else [f.result() for f in pending[row['id']]]
-            with (output/'expert-loss-cache.jsonl').open('a') as f:
-                f.write(json.dumps(dict(id=row['id'], expert_ids=architecture.expert_ids,
+            if row['id'] not in cache:
+                value = dict(id=row['id'], expert_ids=list(architecture.expert_ids),
                     expert_losses=losses, target_tokens=len(row['target_ids']),
-                    tokens_sha256=token_hash(row)))+'\n')
+                    tokens_sha256=token_hash(row))
+                with (output/'expert-loss-cache.jsonl').open('a') as f:
+                    f.write(json.dumps(value)+'\n')
+                cache[row['id']] = value
             examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'], tuple(losses)))
         return examples
     def batches(data):
@@ -175,12 +179,54 @@ def main():
                     raise ValueError('last global batch needs at least one sample per rank')
                 batch = collate_requests(part)
                 yield {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    policy = BestCheckpointPolicy(config.validation_interval_steps)
+    def validate_and_save(step):
+        router.eval()
+        numerator = denominator = regret = correct = count = 0.
+        expert_totals = torch.zeros(2, device=device)
+        routed_counts = torch.zeros(2, device=device)
+        oracle_loss_total = 0.
+        with torch.inference_mode():
+            for batch in batches(valid):
+                with torch.autocast('npu', dtype=torch.bfloat16):
+                    logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
+                losses = batch['expert_losses']
+                ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
+                numerator += (ce*weights).sum().item(); denominator += weights.sum().item()
+                selected = logits.argmax(-1); oracle = losses.min(-1)
+                regret += (losses.gather(1, selected[:, None]).squeeze(1)-oracle.values).sum().item()
+                correct += (selected == oracle.indices).sum().item(); count += len(selected)
+                expert_totals += losses.sum(0)
+                routed_counts += torch.bincount(selected, minlength=2)
+                oracle_loss_total += oracle.values.sum().item()
+        summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total], device=device)
+        if world > 1:
+            dist.all_reduce(summary)
+            dist.all_reduce(expert_totals)
+            dist.all_reduce(routed_counts)
+        numerator, denominator, regret, correct, count, oracle_loss_total = summary.tolist()
+        record(split='valid', epoch=1, step=step, loss=numerator/denominator, mean_routing_regret=regret/count,
+               top1_accuracy=correct/count, sample_count=int(count),
+               fixed_expert_mean_loss=(expert_totals/count).tolist(),
+               fixed_expert_mean_regret=((expert_totals-oracle_loss_total)/count).tolist(),
+               routed_expert_counts=routed_counts.tolist())
+        assert count == len(valid)
+        improved = policy.observe(step, regret/count)
+        if rank == 0 and improved:
+            save_checkpoint(output/'checkpoint_best.pt', router=router, optimizer=optimizer, scheduler=scheduler,
+                epoch=1, best_validation_regret=policy.best_regret, architecture=architecture,
+                training_config=config, global_step=step)
+            record(stage='best_checkpoint_saved', step=step, best_validation_regret=policy.best_regret)
+        if world > 1:
+            dist.barrier()
+        train_model.train()
     record(stage='started', epochs=1, device='npu', train_samples=len(train), validation_samples=len(valid),
            expert_ids=architecture.expert_ids, loss='gap_weighted_sequence_soft_target_cross_entropy',
            tau=config.temperature, alpha=config.gap_alpha, gap_scale=config.gap_scale,
            frozen_embedding=True, full_prompt=True, synthetic=False,
            scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
-           world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch)
+           world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
+           validation_interval_steps=config.validation_interval_steps, checkpoint_policy='best_only_by_mean_routing_regret')
     with ThreadPoolExecutor(max_workers=sum(map(len, pools))) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
         train_model.train()
         torch.manual_seed(config.seed + rank)
@@ -213,36 +259,11 @@ def main():
                    weight_mean=(totals[1]/totals[2]).item(), weight_max=weights.max().item(),
                    expert_loss_mean=(totals[3:5]/totals[2]).tolist(), grad_norm=norm.item(),
                    allocated_bytes=torch.npu.memory_allocated(), reserved_bytes=torch.npu.memory_reserved())
-        router.eval()
-        numerator = denominator = regret = correct = count = 0.
-        expert_totals = torch.zeros(2, device=device)
-        routed_counts = torch.zeros(2, device=device)
-        oracle_loss_total = 0.
-        with torch.inference_mode():
-            for batch in batches(valid):
-                with torch.autocast('npu', dtype=torch.bfloat16):
-                    logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
-                losses = batch['expert_losses']
-                ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
-                numerator += (ce*weights).sum().item(); denominator += weights.sum().item()
-                selected = logits.argmax(-1); oracle = losses.min(-1)
-                regret += (losses.gather(1, selected[:, None]).squeeze(1)-oracle.values).sum().item()
-                correct += (selected == oracle.indices).sum().item(); count += len(selected)
-                expert_totals += losses.sum(0)
-                routed_counts += torch.bincount(selected, minlength=2)
-                oracle_loss_total += oracle.values.sum().item()
-        summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total], device=device)
-        if world > 1:
-            dist.all_reduce(summary)
-            dist.all_reduce(expert_totals)
-            dist.all_reduce(routed_counts)
-        numerator, denominator, regret, correct, count, oracle_loss_total = summary.tolist()
-        record(split='valid', epoch=1, loss=numerator/denominator, mean_routing_regret=regret/count,
-               top1_accuracy=correct/count, sample_count=int(count),
-               fixed_expert_mean_loss=(expert_totals/count).tolist(),
-               fixed_expert_mean_regret=((expert_totals-oracle_loss_total)/count).tolist(),
-               routed_expert_counts=routed_counts.tolist())
-    assert seen == len(train) and count == len(valid)
+            if policy.due(step):
+                validate_and_save(step)
+        if policy.due(step, final=True):
+            validate_and_save(step)
+    assert seen == len(train)
     assert not embedding.weight.requires_grad and embedding.weight.grad is None
     final_digest = digest(router)
     assert final_digest != before, 'router parameters did not update'
@@ -254,10 +275,8 @@ def main():
         dist.barrier()
         dist.destroy_process_group()
         return
-    save_checkpoint(output/'checkpoint_last.pt', router=router, optimizer=optimizer, scheduler=scheduler,
-                    epoch=1, best_validation_regret=regret/count, architecture=architecture,
-                    training_config=config, global_step=step)
-    record(stage='complete', epochs=1, trained_samples=seen, steps=step, checkpoint=str(output/'checkpoint_last.pt'),
+    record(stage='complete', epochs=1, trained_samples=seen, steps=step, checkpoint=str(output/'checkpoint_best.pt'),
+           best_validation_regret=policy.best_regret,
            router_parameters_changed=True, embedding_frozen=True, world_size=world, parameter_consistency=True)
     if world > 1:
         dist.barrier()

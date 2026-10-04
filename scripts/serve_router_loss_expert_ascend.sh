@@ -18,5 +18,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" --quantization moqe_ascend_int4 \
   --served-model-name "moqe-qwen3-$EXPERT_KIND" --host 0.0.0.0 --port "${PORT:-18120}" \
   --tensor-parallel-size 1 --dtype float16 --max-model-len 12288 \
-  --max-num-seqs 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 12288 \
+  --max-num-seqs "${MAX_NUM_SEQS:-2}" --gpu-memory-utilization "${HBM_UTILIZATION:-0.5}" --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-12288}" \
   --enforce-eager --disable-frontend-multiprocessing --disable-log-requests

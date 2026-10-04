@@ -14,6 +14,8 @@ import random
 import sys
 import time
 import urllib.request
+import urllib.error
+import threading
 import subprocess
 import shlex
 
@@ -43,7 +45,10 @@ def main():
                         help='Prefetch this many samples; router batch size stays in config')
     parser.add_argument('--stream', action='store_true', help='Bounded-memory input using the preparation manifest')
     parser.add_argument('--raw-source-host', help='Host serving a CPU raw-tokenization stream on port 19190')
+    parser.add_argument('--expert-concurrency', type=int, default=2, help='Maximum in-flight requests per expert instance')
     args = parser.parse_args()
+    if args.expert_concurrency < 1:
+        parser.error('--expert-concurrency must be positive')
     if not args.raw_source_host and not args.requests:
         parser.error('--requests or --raw-source-host is required')
     config = TrainingConfig.from_json(args.config)
@@ -190,14 +195,25 @@ def main():
             if len(value['expert_losses']) != 2 or not all(math.isfinite(x) for x in value['expert_losses']):
                 raise ValueError('invalid cached expert losses')
             cache[value['id']] = value
+    endpoint_slots = {url: threading.BoundedSemaphore(args.expert_concurrency) for pool in pools for url in pool}
     def score(url, name, row):
         ids = row['input_ids'] + row['target_ids']
         payload = dict(model=name, prompt=ids, max_tokens=1, temperature=0, seed=42,
                        echo=True, logprobs=1)
         request = urllib.request.Request(url+'/v1/completions', data=json.dumps(payload).encode(),
                                          headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(request, timeout=1800) as response:
-            result = json.load(response)
+        with endpoint_slots[url]:
+            for attempt in range(6):
+                try:
+                    with urllib.request.urlopen(request, timeout=1800) as response:
+                        result = json.load(response)
+                    break
+                except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                    if isinstance(error, urllib.error.HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
+                        raise
+                    if attempt == 5:
+                        raise
+                    time.sleep(min(30, 2 ** attempt))
         if result['usage']['prompt_tokens'] != len(ids):
             raise ValueError('expert altered prompt token count')
         logp = result['choices'][0]['logprobs']['token_logprobs']
@@ -315,11 +331,11 @@ def main():
            expert_ids=architecture.expert_ids, loss='gap_weighted_sequence_soft_target_cross_entropy',
            tau=config.temperature, alpha=config.gap_alpha, gap_scale=config.gap_scale,
            frozen_embedding=True, full_prompt=True, synthetic=False,
-           scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
+           expert_concurrency=args.expert_concurrency, scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
            world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
            validation_interval_steps=config.validation_interval_steps, checkpoint_policy='best_only_by_mean_routing_regret', streaming_input=args.stream or bool(args.raw_source_host),
            raw_source_host=args.raw_source_host, train_count_is_estimate=bool(args.raw_source_host))
-    with ThreadPoolExecutor(max_workers=sum(map(len, pools))) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
+    with ThreadPoolExecutor(max_workers=sum(map(len, pools)) * args.expert_concurrency) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
         train_model.train()
         torch.manual_seed(config.seed + rank)
         seen, step = 0, 0

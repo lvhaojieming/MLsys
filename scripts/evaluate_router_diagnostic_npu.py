@@ -43,6 +43,7 @@ def main():
     p.add_argument('--requests', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--batch-size', type=int, default=8)
+    p.add_argument('--base-model-path', help='Override checkpoint embedding path for evaluation on another host')
     a = p.parse_args()
     if a.batch_size < 1:
         p.error('batch-size must be positive')
@@ -59,7 +60,7 @@ def main():
     torch.npu.set_device(0)
     device = torch.device('npu:0')
     torch.backends.mha.set_fastpath_enabled(False)
-    embedding = FrozenEmbeddingProvider.from_checkpoint(config['base_model_path'],
+    embedding = FrozenEmbeddingProvider.from_checkpoint(a.base_model_path or config['base_model_path'],
         weight_key=config['embedding_weight_key'], embedding_dim=architecture.embedding_dim).to(device).eval()
     router = EmbeddingRouter(architecture).to(device)
     router.load_state_dict(checkpoint['router_state_dict'], strict=True)

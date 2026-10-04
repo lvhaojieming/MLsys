@@ -227,6 +227,7 @@ def main():
     def token_hash(row):
         return hashlib.sha256(json.dumps(row['input_ids']+row['target_ids']).encode()).hexdigest()
     def paired(batch):
+        scoring_started = time.monotonic()
         pending = {}
         queues = [Queue(), Queue()]
         for row in batch:
@@ -261,6 +262,9 @@ def main():
                     f.write(json.dumps(value)+'\n')
                 cache[row['id']] = value
             examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'], tuple(losses)))
+        elapsed = time.monotonic() - scoring_started
+        record(stage='expert_scoring', samples=len(batch), new_scored_samples=len(pending),
+               seconds=elapsed, new_samples_per_second=len(pending)/elapsed if pending else None)
         return examples
     def batches(data):
         iterator = iter(data)

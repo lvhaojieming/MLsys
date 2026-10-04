@@ -15,10 +15,13 @@ done
 for host in ${GPTQ_HOSTS:-10.107.206.210 10.107.206.211 10.107.206.216}; do
   for port in {19000..19007}; do GPTQ_URLS+=("http://$host:$port"); done
 done
+EXTRA_ARGS=()
+if [[ "${STREAM_DATA:-0}" == 1 ]]; then EXTRA_ARGS+=(--stream); fi
+if [[ -n "${RAW_SOURCE_HOST:-}" ]]; then EXTRA_ARGS+=(--raw-source-host "$RAW_SOURCE_HOST"); fi
 exec torchrun --standalone --nnodes=1 --nproc-per-node="${ROUTER_RANKS:-6}" \
   scripts/train_router_online_npu.py \
   --config "${TRAIN_CONFIG:-configs/qwen3_14b_router_npu_pilot.json}" \
   --requests "${REQUESTS:-/workspace/zhangjinhao/router-data/pilot-gap/requests.jsonl}" \
   --awq-url "${AWQ_URLS[@]}" --gptq-url "${GPTQ_URLS[@]}" \
   --score-window "${SCORE_WINDOW:-192}" \
-  --loss-cache "${LOSS_CACHE:-/workspace/zhangjinhao/router-training/paired-loss-reuse.jsonl}"
+  --loss-cache "${LOSS_CACHE:-/workspace/zhangjinhao/router-training/paired-loss-reuse.jsonl}" "${EXTRA_ARGS[@]}"

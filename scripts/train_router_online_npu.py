@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
+from itertools import islice
+from array import array
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -12,6 +14,8 @@ import random
 import sys
 import time
 import urllib.request
+import subprocess
+import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
@@ -31,13 +35,17 @@ from moqe_router.training.trainer import TrainingConfig, build_scheduler, save_c
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
-    parser.add_argument('--requests', required=True)
+    parser.add_argument('--requests')
     parser.add_argument('--awq-url', nargs='+', required=True)
     parser.add_argument('--gptq-url', nargs='+', required=True)
     parser.add_argument('--loss-cache', help='Optional previously computed paired loss cache')
     parser.add_argument('--score-window', type=int, default=64,
                         help='Prefetch this many samples; router batch size stays in config')
+    parser.add_argument('--stream', action='store_true', help='Bounded-memory input using the preparation manifest')
+    parser.add_argument('--raw-source-host', help='Host serving a CPU raw-tokenization stream on port 19190')
     args = parser.parse_args()
+    if not args.raw_source_host and not args.requests:
+        parser.error('--requests or --raw-source-host is required')
     config = TrainingConfig.from_json(args.config)
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     world = int(os.environ.get('WORLD_SIZE', '1'))
@@ -60,15 +68,87 @@ def main():
         raise FileExistsError('choose a fresh output directory')
     if world > 1:
         dist.barrier()
-    rows = [json.loads(s) for s in Path(args.requests).read_text().splitlines()]
-    train = [r for r in rows if r['split'] == 'train']
-    valid = [r for r in rows if r['split'] == 'valid']
-    if not train or not valid or len({r['id'] for r in rows}) != len(rows):
-        raise ValueError('nonempty disjoint train/validation samples required')
-    if {r['group_id'] for r in train} & {r['group_id'] for r in valid}:
-        raise ValueError('train/validation groups overlap')
     torch.manual_seed(config.seed)
-    random.Random(config.seed).shuffle(train)
+    producer = None
+    raw_counts = {}
+    if args.raw_source_host:
+        valid = []
+        header = [None]
+        if rank == 0:
+            producer = urllib.request.urlopen('http://' + args.raw_source_host + ':19190/stream', timeout=1800)
+            for line in producer:
+                row = json.loads(line)
+                if row.get('event') == 'ready':
+                    header[0] = row
+                    break
+                if row.get('split') != 'valid':
+                    raise ValueError('raw stream must begin with fixed validation samples')
+                valid.append(row)
+            if header[0] is None:
+                raise RuntimeError('raw tokenizer exited before readiness; inspect the raw-stream server log')
+        if world > 1:
+            dist.broadcast_object_list(header, src=0)
+        train_count = header[0]['estimated_train_samples']
+        valid_count = header[0]['validation_samples']
+        def live_rows():
+            for line in producer:
+                row = json.loads(line)
+                if row.get('event') == 'complete':
+                    raw_counts.update(row['counts'])
+                    continue
+                if row.get('split') != 'train':
+                    raise ValueError('unexpected raw-stream record')
+                yield row
+            producer.close()
+            if 'train' not in raw_counts:
+                raise RuntimeError('raw tokenizer failed before completing one pass')
+        train = live_rows() if rank == 0 else []
+    elif args.stream:
+        manifest = json.loads(Path(args.requests).with_suffix('.manifest.json').read_text())
+        train_count, valid_count = manifest['counts']['train'], manifest['counts']['valid']
+        if not train_count or not valid_count:
+            raise ValueError('nonempty train and validation required')
+        valid = []
+        offsets = array('Q')
+        if rank == 0:
+            observed = 0
+            with Path(args.requests).open('rb') as stream:
+                while True:
+                    offset = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    row = json.loads(line)
+                    if row['split'] == 'valid':
+                        valid.append(row)
+                    elif row['split'] == 'train':
+                        observed += 1
+                        offsets.append(offset)
+                    else:
+                        raise ValueError('unexpected dataset split')
+            if observed != train_count or len(valid) != valid_count:
+                raise ValueError('dataset and preparation manifest counts differ')
+        def train_rows():
+            valid_groups = {r['group_id'] for r in valid}
+            random.Random(config.seed).shuffle(offsets)
+            with Path(args.requests).open('rb') as stream:
+                for offset in offsets:
+                    stream.seek(offset)
+                    row = json.loads(stream.readline())
+                    if row['group_id'] in valid_groups:
+                        raise ValueError('train/validation groups overlap')
+                    yield row
+        train = train_rows() if rank == 0 else []
+    else:
+        rows = [json.loads(s) for s in Path(args.requests).read_text().splitlines()]
+        train = [r for r in rows if r['split'] == 'train']
+        valid = [r for r in rows if r['split'] == 'valid']
+        if not train or not valid or len({r['id'] for r in rows}) != len(rows):
+            raise ValueError('nonempty disjoint train/validation samples required')
+        if {r['group_id'] for r in train} & {r['group_id'] for r in valid}:
+            raise ValueError('train/validation groups overlap')
+        random.Random(config.seed).shuffle(train)
+        train_count, valid_count = len(train), len(valid)
     torch.backends.mha.set_fastpath_enabled(False)
     embedding = FrozenEmbeddingProvider.from_checkpoint(config.base_model_path,
         weight_key=config.embedding_weight_key, embedding_dim=architecture.embedding_dim).to(device).eval()
@@ -76,7 +156,7 @@ def main():
     train_model = DistributedDataParallel(router, device_ids=[local_rank], broadcast_buffers=False) if world > 1 else router
     optimizer = torch.optim.AdamW(router.parameters(), lr=config.lr, betas=config.betas,
                                  eps=config.eps, weight_decay=config.weight_decay)
-    scheduler = build_scheduler(optimizer, total_steps=math.ceil(len(train)/global_batch),
+    scheduler = build_scheduler(optimizer, total_steps=math.ceil(train_count/global_batch),
                                warmup_ratio=config.warmup_ratio, min_lr_ratio=config.min_lr_ratio)
     metrics = output / 'metrics.jsonl'
     def record(**values):
@@ -157,27 +237,37 @@ def main():
             examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'], tuple(losses)))
         return examples
     def batches(data):
-        chunks = [data[i:i+args.score_window] for i in range(0, len(data), args.score_window)]
-        pending = prefetch.submit(paired, chunks[0]) if rank == 0 else None
-        for i in range(len(chunks)):
+        iterator = iter(data)
+        first = list(islice(iterator, args.score_window)) if rank == 0 else []
+        pending = prefetch.submit(paired, first) if first else None
+        while True:
             payload = [None]
             if rank == 0:
                 try:
-                    payload[0] = {'examples': pending.result()}
-                    if i+1 < len(chunks):
-                        pending = prefetch.submit(paired, chunks[i+1])
+                    if pending is None:
+                        payload[0] = {'done': True}
+                    else:
+                        payload[0] = {'examples': pending.result()}
+                        next_chunk = list(islice(iterator, args.score_window))
+                        pending = prefetch.submit(paired, next_chunk) if next_chunk else None
                 except Exception as error:
                     payload[0] = {'error': repr(error)}
             if world > 1:
                 dist.broadcast_object_list(payload, src=0)
+            if payload[0].get('done'):
+                break
             if 'error' in payload[0]:
                 raise RuntimeError('expert scoring failed: '+payload[0]['error'])
             examples = payload[0]['examples']
             for start in range(0, len(examples), global_batch):
-                part = examples[start:start+global_batch][rank::world]
-                if not part:
-                    raise ValueError('last global batch needs at least one sample per rank')
-                batch = collate_requests(part)
+                slice_ = [(example, True) for example in examples[start:start+global_batch]]
+                # Keep all DDP ranks active even when the final global batch has
+                # fewer than world samples. Padding contributes zero loss/metrics.
+                if len(slice_) < world:
+                    slice_ += [(examples[i % len(examples)], False) for i in range(world-len(slice_))]
+                part = slice_[rank::world]
+                batch = collate_requests([example for example, _ in part])
+                batch['real_mask'] = torch.tensor([real for _, real in part], dtype=torch.float32)
                 yield {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     policy = BestCheckpointPolicy(config.validation_interval_steps)
     def validate_and_save(step):
@@ -192,13 +282,14 @@ def main():
                     logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
                 losses = batch['expert_losses']
                 ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
-                numerator += (ce*weights).sum().item(); denominator += weights.sum().item()
+                real = batch['real_mask']
+                numerator += (ce*weights*real).sum().item(); denominator += (weights*real).sum().item()
                 selected = logits.argmax(-1); oracle = losses.min(-1)
-                regret += (losses.gather(1, selected[:, None]).squeeze(1)-oracle.values).sum().item()
-                correct += (selected == oracle.indices).sum().item(); count += len(selected)
-                expert_totals += losses.sum(0)
-                routed_counts += torch.bincount(selected, minlength=2)
-                oracle_loss_total += oracle.values.sum().item()
+                regret += ((losses.gather(1, selected[:, None]).squeeze(1)-oracle.values)*real).sum().item()
+                correct += ((selected == oracle.indices)*real).sum().item(); count += real.sum().item()
+                expert_totals += (losses*real[:, None]).sum(0)
+                routed_counts += torch.bincount(selected, weights=real, minlength=2)
+                oracle_loss_total += (oracle.values*real).sum().item()
         summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total], device=device)
         if world > 1:
             dist.all_reduce(summary)
@@ -210,7 +301,7 @@ def main():
                fixed_expert_mean_loss=(expert_totals/count).tolist(),
                fixed_expert_mean_regret=((expert_totals-oracle_loss_total)/count).tolist(),
                routed_expert_counts=routed_counts.tolist())
-        assert count == len(valid)
+        assert count == valid_count
         improved = policy.observe(step, regret/count)
         if rank == 0 and improved:
             save_checkpoint(output/'checkpoint_best.pt', router=router, optimizer=optimizer, scheduler=scheduler,
@@ -220,13 +311,14 @@ def main():
         if world > 1:
             dist.barrier()
         train_model.train()
-    record(stage='started', epochs=1, device='npu', train_samples=len(train), validation_samples=len(valid),
+    record(stage='started', epochs=1, device='npu', train_samples=train_count, validation_samples=valid_count,
            expert_ids=architecture.expert_ids, loss='gap_weighted_sequence_soft_target_cross_entropy',
            tau=config.temperature, alpha=config.gap_alpha, gap_scale=config.gap_scale,
            frozen_embedding=True, full_prompt=True, synthetic=False,
            scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
            world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
-           validation_interval_steps=config.validation_interval_steps, checkpoint_policy='best_only_by_mean_routing_regret')
+           validation_interval_steps=config.validation_interval_steps, checkpoint_policy='best_only_by_mean_routing_regret', streaming_input=args.stream or bool(args.raw_source_host),
+           raw_source_host=args.raw_source_host, train_count_is_estimate=bool(args.raw_source_host))
     with ThreadPoolExecutor(max_workers=sum(map(len, pools))) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
         train_model.train()
         torch.manual_seed(config.seed + rank)
@@ -236,6 +328,7 @@ def main():
             with torch.autocast('npu', dtype=torch.bfloat16):
                 logits = train_model(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
             ce, weights = gap_weighted_terms(logits, batch['expert_losses'], config.temperature, config.gap_alpha, config.gap_scale)
+            weights = weights * batch['real_mask']
             weighted_sum = (ce*weights).sum()
             denominator_tensor = weights.sum().detach()
             if world > 1:
@@ -251,7 +344,9 @@ def main():
             if not torch.isfinite(norm).item():
                 raise FloatingPointError('non-finite gradient')
             optimizer.step(); scheduler.step()
-            totals = torch.stack((weighted_sum.detach(), weights.sum(), weights.new_tensor(len(batch['ids'])), batch['expert_losses'][:,0].sum(), batch['expert_losses'][:,1].sum()))
+            totals = torch.stack((weighted_sum.detach(), weights.sum(), batch['real_mask'].sum(),
+                (batch['expert_losses'][:,0]*batch['real_mask']).sum(),
+                (batch['expert_losses'][:,1]*batch['real_mask']).sum()))
             if world > 1:
                 dist.all_reduce(totals)
             step += 1; seen += int(totals[2].item())
@@ -263,7 +358,12 @@ def main():
                 validate_and_save(step)
         if policy.due(step, final=True):
             validate_and_save(step)
-    assert seen == len(train)
+    if args.raw_source_host:
+        final_counts = [raw_counts if rank == 0 else None]
+        if world > 1:
+            dist.broadcast_object_list(final_counts, src=0)
+        train_count = final_counts[0]['train']
+    assert seen == train_count
     assert not embedding.weight.requires_grad and embedding.weight.grad is None
     final_digest = digest(router)
     assert final_digest != before, 'router parameters did not update'

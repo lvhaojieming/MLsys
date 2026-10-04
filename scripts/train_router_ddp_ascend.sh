@@ -16,6 +16,7 @@ for host in ${GPTQ_HOSTS:-10.107.206.210 10.107.206.211 10.107.206.216}; do
   for port in {19000..19007}; do GPTQ_URLS+=("http://$host:$port"); done
 done
 EXTRA_ARGS=()
+if [[ -n "${BALANCED_VALIDATION:-}" ]]; then EXTRA_ARGS+=(--balanced-validation "$BALANCED_VALIDATION"); fi
 if [[ "${STREAM_DATA:-0}" == 1 ]]; then EXTRA_ARGS+=(--stream); fi
 if [[ -n "${RAW_SOURCE_HOST:-}" ]]; then EXTRA_ARGS+=(--raw-source-host "$RAW_SOURCE_HOST"); fi
 exec torchrun --standalone --nnodes=1 --nproc-per-node="${ROUTER_RANKS:-6}" \

@@ -4,6 +4,7 @@ import os
 os.environ['USE_TORCH'] = '0'
 os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
 import argparse
+import hashlib
 from collections import Counter
 import json
 from pathlib import Path
@@ -19,10 +20,12 @@ def main():
     p.add_argument('--tokenizer', required=True)
     p.add_argument('--valid-per-source', type=int, default=128)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--exclude-groups', help='JSON list of diagnostic validation document groups')
     a = p.parse_args()
     if a.valid_per_source < 1:
         raise ValueError('valid-per-source must be positive')
     tokenizer = AutoTokenizer.from_pretrained(a.tokenizer, local_files_only=True)
+    extra_heldout = set(json.loads(Path(a.exclude_groups).read_text())) if a.exclude_groups else set()
     totals = Counter()
     counts = {s: Counter() for s in SOURCES}
     heldout = {s: set() for s in SOURCES}
@@ -53,7 +56,8 @@ def main():
     raw_counts = json.loads((Path(a.raw_root) / 'raw_counts.json').read_text())
     weights = {r['source']: r.get('training_questions', r['training_rows']) for r in raw_counts}
     estimate = sum(weights.values())
-    emit(dict(event='ready', validation_samples=totals['valid'], estimated_train_samples=estimate))
+    emit(dict(event='ready', validation_samples=totals['valid'], estimated_train_samples=estimate,
+              excluded_groups_sha256=hashlib.sha256(json.dumps(sorted(extra_heldout)).encode()).hexdigest()))
     rng = random.Random(a.seed)
     active = list(SOURCES)
     while active:
@@ -63,7 +67,7 @@ def main():
         except StopIteration:
             active.remove(source)
             continue
-        if row['group_id'] in heldout[source]:
+        if row['group_id'] in heldout[source] or row['group_id'] in extra_heldout:
             counts[source]['additional_heldout_samples'] += 1
             continue
         row['split'] = 'train'

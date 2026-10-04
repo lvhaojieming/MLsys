@@ -39,6 +39,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--requests')
+    parser.add_argument('--balanced-validation', help='Separate diagnostic requests JSONL; requires held-out raw groups')
     parser.add_argument('--awq-url', nargs='+', required=True)
     parser.add_argument('--gptq-url', nargs='+', required=True)
     parser.add_argument('--loss-cache', help='Optional previously computed paired loss cache')
@@ -156,6 +157,22 @@ def main():
         random.Random(config.seed).shuffle(train)
         train_count, valid_count = len(train), len(valid)
     torch.backends.mha.set_fastpath_enabled(False)
+    diagnostic = []
+    if args.balanced_validation and rank == 0:
+        with open(args.balanced_validation) as stream:
+            diagnostic = [json.loads(line) for line in stream]
+        diagnostic_groups = {r['group_id'] for r in diagnostic}
+        if not args.raw_source_host:
+            raise ValueError('diagnostic validation currently requires the group-filtered raw stream')
+        expected_digest = hashlib.sha256(json.dumps(sorted(diagnostic_groups)).encode()).hexdigest()
+        if header[0].get('excluded_groups_sha256') != expected_digest:
+            raise ValueError('raw stream must exclude exactly the diagnostic document groups')
+        if not diagnostic or diagnostic_groups & {r['group_id'] for r in valid}:
+            raise ValueError('diagnostic validation must be nonempty and group-disjoint')
+    diagnostic_header = [len(diagnostic)]
+    if world > 1:
+        dist.broadcast_object_list(diagnostic_header, src=0)
+    diagnostic_count = diagnostic_header[0]
     embedding = FrozenEmbeddingProvider.from_checkpoint(config.base_model_path,
         weight_key=config.embedding_weight_key, embedding_dim=architecture.embedding_dim).to(device).eval()
     router = EmbeddingRouter(architecture).to(device)
@@ -300,14 +317,18 @@ def main():
                 batch['real_mask'] = torch.tensor([real for _, real in part], dtype=torch.float32)
                 yield {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     policy = BestCheckpointPolicy(config.validation_interval_steps)
-    def validate_and_save(step):
+    def validate_and_save(step, data=None, split="valid", expected_count=None):
+        data = valid if data is None else data
+        expected_count = valid_count if expected_count is None else expected_count
         router.eval()
         numerator = denominator = regret = correct = count = 0.
         expert_totals = torch.zeros(2, device=device)
         routed_counts = torch.zeros(2, device=device)
+        oracle_counts = torch.zeros(2, device=device)
+        correct_counts = torch.zeros(2, device=device)
         oracle_loss_total = 0.
         with torch.inference_mode():
-            for batch in batches(valid):
+            for batch in batches(data):
                 with torch.autocast('npu', dtype=torch.bfloat16):
                     logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
                 losses = batch['expert_losses']
@@ -319,20 +340,26 @@ def main():
                 correct += ((selected == oracle.indices)*real).sum().item(); count += real.sum().item()
                 expert_totals += (losses*real[:, None]).sum(0)
                 routed_counts += torch.bincount(selected, weights=real, minlength=2)
+                oracle_counts += torch.bincount(oracle.indices, weights=real, minlength=2)
+                correct_counts += torch.bincount(oracle.indices, weights=real*(selected == oracle.indices), minlength=2)
                 oracle_loss_total += (oracle.values*real).sum().item()
         summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total], device=device)
         if world > 1:
             dist.all_reduce(summary)
             dist.all_reduce(expert_totals)
             dist.all_reduce(routed_counts)
+            dist.all_reduce(oracle_counts)
+            dist.all_reduce(correct_counts)
         numerator, denominator, regret, correct, count, oracle_loss_total = summary.tolist()
-        record(split='valid', epoch=1, step=step, loss=numerator/denominator, mean_routing_regret=regret/count,
+        record(split=split, epoch=1, step=step, loss=numerator/denominator, mean_routing_regret=regret/count,
                top1_accuracy=correct/count, sample_count=int(count),
                fixed_expert_mean_loss=(expert_totals/count).tolist(),
                fixed_expert_mean_regret=((expert_totals-oracle_loss_total)/count).tolist(),
-               routed_expert_counts=routed_counts.tolist())
-        assert count == valid_count
-        improved = policy.observe(step, regret/count)
+               routed_expert_counts=routed_counts.tolist(),
+               oracle_expert_counts=oracle_counts.tolist(),
+               per_expert_oracle_recall=[float(correct_counts[i]/oracle_counts[i]) if oracle_counts[i] else None for i in range(2)])
+        assert count == expected_count
+        improved = policy.observe(step, regret/count) if split == "valid" else False
         if rank == 0 and improved:
             save_checkpoint(output/'checkpoint_best.pt', router=router, optimizer=optimizer, scheduler=scheduler,
                 epoch=1, best_validation_regret=policy.best_regret, architecture=architecture,
@@ -341,6 +368,8 @@ def main():
         if world > 1:
             dist.barrier()
         train_model.train()
+        if split == "valid" and diagnostic_count:
+            validate_and_save(step, diagnostic, "valid_balanced", diagnostic_count)
     record(stage='started', epochs=1, device='npu', train_samples=train_count, validation_samples=valid_count,
            expert_ids=architecture.expert_ids, loss='sequence_soft_target_cross_entropy',
            tau=config.temperature, sample_weighting="uniform",

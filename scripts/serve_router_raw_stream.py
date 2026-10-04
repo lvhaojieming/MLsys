@@ -14,6 +14,7 @@ def main():
     p.add_argument('--tokenizer', required=True)
     p.add_argument('--port', type=int, default=19190)
     p.add_argument('--log', required=True)
+    p.add_argument('--exclude-groups')
     a = p.parse_args()
     lock = threading.Lock()
     class Handler(BaseHTTPRequestHandler):
@@ -31,7 +32,8 @@ def main():
                 self.end_headers()
                 with Path(a.log).open('a') as log:
                     process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).with_name('stream_router_raw.py')),
-                        '--raw-root', a.raw_root, '--tokenizer', a.tokenizer], stdout=subprocess.PIPE, stderr=log)
+                        '--raw-root', a.raw_root, '--tokenizer', a.tokenizer] +
+                        (['--exclude-groups', a.exclude_groups] if a.exclude_groups else []), stdout=subprocess.PIPE, stderr=log)
                     for line in process.stdout:
                         self.wfile.write(line); self.wfile.flush()
                     process.wait()

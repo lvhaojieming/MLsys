@@ -1,0 +1,29 @@
+{
+  "architecture_config": "configs/qwen3_14b_router_two_experts.json",
+  "train_data": "/workspace/zhangjinhao/router-data/full-gap/requests.jsonl",
+  "valid_data": "/workspace/zhangjinhao/router-data/full-gap/requests.jsonl",
+  "base_model_path": "/workspace/zhangjinhao/router-base-embedding",
+  "embedding_weight_key": "model.embed_tokens.weight",
+  "output_dir": "/workspace/zhangjinhao/router-training/gap-full-raw-native-c8",
+  "seed": 42,
+  "epochs": 1,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "eps": 1E-08,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.05,
+  "min_lr_ratio": 0.1,
+  "max_grad_norm": 1.0,
+  "temperature": 0.1,
+  "precision": "bf16",
+  "num_workers": 0,
+  "pin_memory": false,
+  "max_prompt_tokens": 12288,
+  "gap_alpha": 2.0,
+  "gap_scale": 0.1,
+  "validation_interval_steps": 5000
+}

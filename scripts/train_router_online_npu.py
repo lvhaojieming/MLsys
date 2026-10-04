@@ -46,7 +46,7 @@ def main():
                         help='Prefetch this many samples; router batch size stays in config')
     parser.add_argument('--stream', action='store_true', help='Bounded-memory input using the preparation manifest')
     parser.add_argument('--raw-source-host', help='Host serving a CPU raw-tokenization stream on port 19190')
-    parser.add_argument('--expert-concurrency', type=int, default=2, help='Maximum in-flight requests per expert instance')
+    parser.add_argument('--expert-concurrency', type=int, default=8, help='Maximum in-flight requests per expert instance')
     args = parser.parse_args()
     if args.expert_concurrency < 1:
         parser.error('--expert-concurrency must be positive')
@@ -415,4 +415,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

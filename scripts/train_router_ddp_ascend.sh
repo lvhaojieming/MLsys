@@ -23,6 +23,6 @@ exec torchrun --standalone --nnodes=1 --nproc-per-node="${ROUTER_RANKS:-6}" \
   --config "${TRAIN_CONFIG:-configs/qwen3_14b_router_npu_pilot.json}" \
   --requests "${REQUESTS:-/workspace/zhangjinhao/router-data/pilot-gap/requests.jsonl}" \
   --awq-url "${AWQ_URLS[@]}" --gptq-url "${GPTQ_URLS[@]}" \
-  --expert-concurrency "${EXPERT_CONCURRENCY:-2}" \
+  --expert-concurrency "${EXPERT_CONCURRENCY:-8}" \
   --score-window "${SCORE_WINDOW:-192}" \
   --loss-cache "${LOSS_CACHE:-/workspace/zhangjinhao/router-training/paired-loss-reuse.jsonl}" "${EXTRA_ARGS[@]}"

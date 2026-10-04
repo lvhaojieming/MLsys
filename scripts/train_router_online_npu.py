@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from itertools import islice
+from queue import Queue, Empty
 from array import array
 import os
 from datetime import timedelta
@@ -225,24 +226,33 @@ def main():
         return -sum(values)/len(values)
     def token_hash(row):
         return hashlib.sha256(json.dumps(row['input_ids']+row['target_ids']).encode()).hexdigest()
-    dispatch_counts = [0, 0]
     def paired(batch):
         pending = {}
+        queues = [Queue(), Queue()]
         for row in batch:
             cached = cache.get(row['id'])
             if cached:
                 if cached['tokens_sha256'] != token_hash(row) or cached['target_tokens'] != len(row['target_ids']):
                     raise ValueError('cached loss belongs to different tokens')
                 continue
-            futures = []
-            for expert, (pool, name) in enumerate(zip(pools, expected_names)):
-                url = pool[dispatch_counts[expert] % len(pool)]
-                dispatch_counts[expert] += 1
-                futures.append(score_pool.submit(score, url, name, row))
-            pending[row['id']] = futures
+            pending[row['id']] = [None, None]
+            for queue in queues:
+                queue.put(row)
+        def consume(expert, url, name):
+            while True:
+                try:
+                    row = queues[expert].get_nowait()
+                except Empty:
+                    return
+                pending[row['id']][expert] = score(url, name, row)
+        workers = [score_pool.submit(consume, expert, url, name)
+                   for expert, (pool, name) in enumerate(zip(pools, expected_names))
+                   for url in pool for _ in range(args.expert_concurrency)]
+        for worker in workers:
+            worker.result()
         examples = []
         for row in batch:
-            losses = cache[row['id']]['expert_losses'] if row['id'] in cache else [f.result() for f in pending[row['id']]]
+            losses = cache[row['id']]['expert_losses'] if row['id'] in cache else pending[row['id']]
             if row['id'] not in cache:
                 value = dict(id=row['id'], expert_ids=list(architecture.expert_ids),
                     expert_losses=losses, target_tokens=len(row['target_ids']),

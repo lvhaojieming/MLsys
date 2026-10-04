@@ -22,7 +22,5 @@
   "precision": "bf16",
   "num_workers": 2,
   "pin_memory": false,
-  "max_prompt_tokens": 8192,
-  "gap_alpha": 2.0,
-  "gap_scale": 0.1
+  "max_prompt_tokens": 8192
 }

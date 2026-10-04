@@ -30,24 +30,19 @@ def soft_target_cross_entropy(logits: Tensor, target_probs: Tensor) -> Tensor:
     return -(target_probs * log_probs).sum(dim=-1).mean()
 
 
-def gap_weighted_terms(logits: Tensor, expert_losses: Tensor, temperature: float,
-                       alpha: float = 2.0, gap_scale: float = 0.1) -> tuple[Tensor, Tensor]:
-    """Return per-sequence CE and bounded, detached weights for two experts."""
-    if logits.ndim != 2 or logits.shape != expert_losses.shape or logits.shape[1] != 2:
-        raise ValueError("gap weighting requires matching [batch, 2] tensors")
-    if not math.isfinite(alpha) or alpha < 0:
-        raise ValueError("alpha must be finite and nonnegative")
-    if not math.isfinite(gap_scale) or gap_scale <= 0:
-        raise ValueError("gap_scale must be finite and positive")
+def loss_aware_terms(logits: Tensor, expert_losses: Tensor, temperature: float) -> tuple[Tensor, Tensor]:
+    """Return per-sequence soft-target CE and unit sample weights.
+
+    Unit weights preserve the distributed real-sample mask/reduction interface.
+    Expert loss gaps affect the soft target, never the sample's contribution.
+    """
+    if logits.ndim != 2 or logits.shape != expert_losses.shape:
+        raise ValueError("logits and expert_losses must have matching [batch, experts] shapes")
     targets = build_loss_aware_targets(expert_losses, temperature)
-    losses = expert_losses.detach().float()
-    gap = (losses[:, 0] - losses[:, 1]).abs()
-    weights = 1.0 + alpha * gap / (gap + gap_scale)
     ce = -(targets * F.log_softmax(logits.float(), dim=-1)).sum(-1)
-    return ce, weights
+    return ce, torch.ones_like(ce)
 
 
-def gap_weighted_router_loss(logits: Tensor, expert_losses: Tensor, temperature: float = 0.1,
-                             alpha: float = 2.0, gap_scale: float = 0.1) -> Tensor:
-    ce, weights = gap_weighted_terms(logits, expert_losses, temperature, alpha, gap_scale)
-    return (ce * weights).sum() / weights.sum()
+def loss_aware_router_loss(logits: Tensor, expert_losses: Tensor, temperature: float = 0.1) -> Tensor:
+    ce, _ = loss_aware_terms(logits, expert_losses, temperature)
+    return ce.mean()

@@ -19,7 +19,7 @@ from ..config import RouterArchitecture
 from ..model import EmbeddingRouter
 from .data import RequestDataset, collate_requests
 from .embedding import FrozenEmbeddingProvider
-from .objective import build_loss_aware_targets, gap_weighted_terms
+from .objective import build_loss_aware_targets, loss_aware_terms
 from .trainer import TrainingConfig, build_scheduler, save_checkpoint, load_checkpoint, _move_batch, _log_record
 
 
@@ -109,8 +109,8 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                              batch_per_rank=config.batch_size, global_batch_size=config.batch_size * world,
                              train_samples=len(datasets[0]), validation_samples=len(datasets[1]),
                              sampler_padding_samples=len(sampler) * world - len(datasets[0]),
-                             frozen_embedding=True, loss="gap_weighted_sequence_soft_target_cross_entropy",
-                             gap_alpha=config.gap_alpha, gap_scale=config.gap_scale), metrics)
+                             frozen_embedding=True, loss="sequence_soft_target_cross_entropy",
+                             sample_weighting="uniform"), metrics)
         for epoch in range(epoch_done + 1, config.epochs + 1):
             sampler.set_epoch(epoch)
             seed(config.seed + epoch * world + rank)
@@ -122,11 +122,11 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                 vectors = embedding(ids)
                 with torch.autocast(device_type=device_kind, dtype=torch.bfloat16):
                     logits = ddp(vectors, mask, budget)
-                ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
+                ce, weights = loss_aware_terms(logits, losses, config.temperature)
                 weight_total = weights.sum().detach()
                 dist.all_reduce(weight_total)
                 numerator = (ce * weights).sum()
-                # DDP averages gradients: compensate to obtain a global weighted mean.
+                # DDP averages gradients: compensate to obtain a global mean over real samples.
                 loss = numerator * world / weight_total
                 finite = torch.isfinite(loss).to(torch.int32)
                 dist.all_reduce(finite, op=dist.ReduceOp.MIN)
@@ -151,7 +151,7 @@ def train(config: TrainingConfig, *, device_kind: str, resume: str | None = None
                     _, ids, mask, budget, losses = _move_batch(batch, device)
                     with torch.autocast(device_type=device_kind, dtype=torch.bfloat16):
                         logits = router(embedding(ids), mask, budget)
-                    ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
+                    ce, weights = loss_aware_terms(logits, losses, config.temperature)
                     selected = logits.argmax(-1)
                     oracle = losses.min(-1)
                     totals[0] += (ce * weights).sum()

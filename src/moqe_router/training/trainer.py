@@ -22,7 +22,7 @@ from ..model import EmbeddingRouter
 from .data import RequestDataset, collate_requests
 from .embedding import FrozenEmbeddingProvider
 from .metrics import routing_metrics
-from .objective import build_loss_aware_targets, gap_weighted_router_loss, gap_weighted_terms
+from .objective import build_loss_aware_targets, loss_aware_router_loss, loss_aware_terms
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,8 @@ class TrainingConfig:
     num_workers: int
     pin_memory: bool
     max_prompt_tokens: int
-    gap_alpha: float = 2.0
+    # Legacy config/checkpoint fields; sample weighting is always uniform now.
+    gap_alpha: float = 0.0
     gap_scale: float = 0.1
     validation_interval_steps: int = 5000
 
@@ -241,7 +242,7 @@ def validate(
     device: torch.device,
     temperature: float,
     epoch: int,
-    gap_alpha: float = 2.0,
+    gap_alpha: float = 0.0,
     gap_scale: float = 0.1,
 ) -> dict[str, float | int | str]:
     router.eval()
@@ -273,7 +274,7 @@ def validate(
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = router(embeddings, attention_mask, max_new_tokens)
-                ce, weights = gap_weighted_terms(logits, expert_losses, temperature, gap_alpha, gap_scale)
+                ce, weights = loss_aware_terms(logits, expert_losses, temperature)
                 loss = (ce * weights).sum() / weights.sum()
             _finite_or_raise(
                 "logits", logits, epoch=epoch, sample_ids=sample_ids, loss=loss
@@ -423,7 +424,7 @@ def train(training_config: TrainingConfig, resume: str | Path | None = None) -> 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = router(embeddings, attention_mask, max_new_tokens)
-                loss = gap_weighted_router_loss(logits, expert_losses, training_config.temperature, training_config.gap_alpha, training_config.gap_scale)
+                loss = loss_aware_router_loss(logits, expert_losses, training_config.temperature)
             _finite_or_raise(
                 "logits", logits, epoch=epoch, sample_ids=sample_ids, loss=loss
             )

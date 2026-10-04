@@ -30,7 +30,7 @@ from moqe_router.config import RouterArchitecture
 from moqe_router.model import EmbeddingRouter
 from moqe_router.training.data import TrainingExample, collate_requests
 from moqe_router.training.embedding import FrozenEmbeddingProvider
-from moqe_router.training.objective import gap_weighted_terms
+from moqe_router.training.objective import loss_aware_terms
 from moqe_router.training.checkpoint_policy import BestCheckpointPolicy
 from moqe_router.training.trainer import TrainingConfig, build_scheduler, save_checkpoint
 
@@ -311,7 +311,7 @@ def main():
                 with torch.autocast('npu', dtype=torch.bfloat16):
                     logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
                 losses = batch['expert_losses']
-                ce, weights = gap_weighted_terms(logits, losses, config.temperature, config.gap_alpha, config.gap_scale)
+                ce, weights = loss_aware_terms(logits, losses, config.temperature)
                 real = batch['real_mask']
                 numerator += (ce*weights*real).sum().item(); denominator += (weights*real).sum().item()
                 selected = logits.argmax(-1); oracle = losses.min(-1)
@@ -342,8 +342,8 @@ def main():
             dist.barrier()
         train_model.train()
     record(stage='started', epochs=1, device='npu', train_samples=train_count, validation_samples=valid_count,
-           expert_ids=architecture.expert_ids, loss='gap_weighted_sequence_soft_target_cross_entropy',
-           tau=config.temperature, alpha=config.gap_alpha, gap_scale=config.gap_scale,
+           expert_ids=architecture.expert_ids, loss='sequence_soft_target_cross_entropy',
+           tau=config.temperature, sample_weighting="uniform",
            frozen_embedding=True, full_prompt=True, synthetic=False,
            expert_concurrency=args.expert_concurrency, scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
            world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
@@ -357,7 +357,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('npu', dtype=torch.bfloat16):
                 logits = train_model(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
-            ce, weights = gap_weighted_terms(logits, batch['expert_losses'], config.temperature, config.gap_alpha, config.gap_scale)
+            ce, weights = loss_aware_terms(logits, batch['expert_losses'], config.temperature)
             weights = weights * batch['real_mask']
             weighted_sum = (ce*weights).sum()
             denominator_tensor = weights.sum().detach()

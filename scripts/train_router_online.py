@@ -55,7 +55,7 @@ def train_online(deployment_path,config_path,resume=None,pilot=False):
     from moqe_router.model import EmbeddingRouter
     from moqe_router.training.embedding import FrozenEmbeddingProvider
     from moqe_router.training.metrics import routing_metrics
-    from moqe_router.training.objective import build_loss_aware_targets, gap_weighted_router_loss
+    from moqe_router.training.objective import build_loss_aware_targets, loss_aware_router_loss
     from moqe_router.training.online_losses import PairedExpertLossCache,prefetched_batches
     from moqe_router.training.trainer import (TrainingConfig,build_scheduler,save_checkpoint,load_checkpoint,
                                             _finite_or_raise,_move_batch,_log_record,_require_bf16_cuda,validate)
@@ -110,7 +110,7 @@ def train_online(deployment_path,config_path,resume=None,pilot=False):
                 with torch.no_grad(): vectors=embedding(input_ids)
                 with torch.autocast('cuda',dtype=torch.bfloat16):
                     logits=router(vectors,mask,budget)
-                    loss=gap_weighted_router_loss(logits,losses,config.temperature,config.gap_alpha,config.gap_scale)
+                    loss=loss_aware_router_loss(logits,losses,config.temperature)
                 for name,value in (('expert_losses',losses),('router_logits',logits),('router_loss',loss)):
                     _finite_or_raise(name,value,epoch=epoch,sample_ids=sample_ids,loss=loss)
                 loss.backward(); grad=torch.nn.utils.clip_grad_norm_(router.parameters(),config.max_grad_norm)

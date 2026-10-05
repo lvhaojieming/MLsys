@@ -58,9 +58,9 @@ def accuracy_aware_terms(
     """Per-sequence task-error CE plus a small NLL soft-target auxiliary term.
 
     Correctness must be 0/1 in architecture expert order, or -1/-1 to denote
-    missing task labels. When both experts share an outcome, NLL soft targets
-    provide the only expert preference signal. Every example receives unit
-    weight; loss gaps never rescale sample contributions.
+    missing task labels. Correct experts share the task target uniformly.
+    All-wrong sequences receive only the auxiliary NLL term. Every example
+    receives unit weight; loss gaps never rescale sample contributions.
     """
     if logits.ndim != 2 or logits.shape != expert_losses.shape or logits.shape != expert_correctness.shape:
         raise ValueError("logits, losses, and correctness must have matching [batch, experts] shapes")
@@ -69,7 +69,7 @@ def accuracy_aware_terms(
     known = (expert_correctness >= 0).all(dim=-1)
     if bool(((expert_correctness < 0).any(dim=-1) & (expert_correctness >= 0).any(dim=-1)).any()):
         raise ValueError("correctness labels must mark every expert or none")
-    if bool((expert_correctness > 1).any()):
+    if not bool(((expert_correctness == 0) | (expert_correctness == 1) | (expert_correctness == -1)).all()):
         raise ValueError("correctness values must be 0/1 or -1 for missing")
 
     nll_targets = build_loss_aware_targets(expert_losses, temperature)
@@ -79,9 +79,6 @@ def accuracy_aware_terms(
     outcomes = expert_correctness.float().clamp_min(0)
     outcome_total = outcomes.sum(-1, keepdim=True)
     known_targets = outcomes / outcome_total.clamp_min(1)
-    # If both experts are correct or both are wrong, accuracy alone cannot
-    # prefer one. Use sequence NLL to break that tie.
-    accuracy_targets = torch.where(outcome_total > 0, known_targets, nll_targets)
-    correctness_ce = -(accuracy_targets * log_probs).sum(-1)
+    correctness_ce = -(known_targets * log_probs).sum(-1)
     task_ce = torch.where(known, correctness_ce, nll_ce)
     return task_ce + nll_aux_weight * nll_ce, correctness_ce, nll_ce, known

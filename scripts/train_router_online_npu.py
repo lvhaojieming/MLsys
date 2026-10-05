@@ -381,6 +381,11 @@ def main():
                oracle_expert_counts=oracle_counts.tolist(),
                per_expert_oracle_recall=[float(correct_counts[i]/oracle_counts[i]) if oracle_counts[i] else None for i in range(2)])
         assert count == expected_count
+        routing_share = (routed_counts/count).tolist()
+        if max(routing_share) >= 0.95:
+            record(stage='routing_imbalance_warning', split=split, step=step,
+                   routed_expert_counts=routed_counts.tolist(), routed_expert_share=routing_share,
+                   threshold=0.95, message='One expert receives at least 95% of validation requests; inspect task accuracy and label preferences')
         selection_metric = 1.0-task_correct/task_count if task_count else regret/count
         improved = policy.observe(step, selection_metric) if split == "valid" else False
         if rank == 0 and improved:
@@ -403,12 +408,16 @@ def main():
            frozen_embedding=True, full_prompt=True, synthetic=False,
            expert_concurrency=args.expert_concurrency, scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
            world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
-           validation_interval_steps=config.validation_interval_steps, checkpoint_policy='best_only_by_mean_routing_regret', streaming_input=args.stream or bool(args.raw_source_host),
+           validation_interval_steps=config.validation_interval_steps, streaming_input=args.stream or bool(args.raw_source_host),
            raw_source_host=args.raw_source_host, train_count_is_estimate=bool(args.raw_source_host))
     with ThreadPoolExecutor(max_workers=sum(map(len, pools)) * args.expert_concurrency) as score_pool, ThreadPoolExecutor(max_workers=1) as prefetch:
         train_model.train()
         torch.manual_seed(config.seed + rank)
         seen, step = 0, 0
+        route_window = torch.zeros(2, device=device)
+        route_cumulative = torch.zeros(2, device=device)
+        dominant_windows = 0
+        last_dominant_expert = None
         for batch in batches(train):
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('npu', dtype=torch.bfloat16):
@@ -435,18 +444,38 @@ def main():
             if not torch.isfinite(norm).item():
                 raise FloatingPointError('non-finite gradient')
             optimizer.step(); scheduler.step()
+            route_counts = torch.bincount(logits.detach().argmax(-1), weights=batch['real_mask'], minlength=2)
             totals = torch.stack((weighted_sum.detach(), weights.sum(), batch['real_mask'].sum(),
                 (batch['expert_losses'][:,0]*batch['real_mask']).sum(),
                 (batch['expert_losses'][:,1]*batch['real_mask']).sum(),
-                correct_sum.detach(), nll_sum.detach()))
+                correct_sum.detach(), nll_sum.detach(), route_counts[0], route_counts[1]))
             if world > 1:
                 dist.all_reduce(totals)
             step += 1; seen += int(totals[2].item())
+            route_window += totals[7:9]
+            route_cumulative += totals[7:9]
             record(split='train', epoch=1, step=step, trained_samples=seen, loss=(totals[0]/totals[1]).item(),
                    weight_mean=(totals[1]/totals[2]).item(), weight_max=weights.max().item(),
                    correctness_ce=(totals[5]/totals[1]).item(), nll_ce=(totals[6]/totals[1]).item(),
                    expert_loss_mean=(totals[3:5]/totals[2]).tolist(), grad_norm=norm.item(),
+                   routed_expert_counts=totals[7:9].tolist(),
+                   routed_expert_share=(totals[7:9]/totals[2]).tolist(),
+                   cumulative_routed_expert_counts=route_cumulative.tolist(),
                    allocated_bytes=torch.npu.memory_allocated(), reserved_bytes=torch.npu.memory_reserved())
+            if step % 20 == 0:
+                share = route_window / route_window.sum()
+                dominant = int(share.argmax().item())
+                exceeds_threshold = share[dominant].item() >= 0.95
+                dominant_windows = (dominant_windows + 1 if dominant == last_dominant_expert else 1) if exceeds_threshold else 0
+                last_dominant_expert = dominant if exceeds_threshold else None
+                record(stage='routing_window', step=step, routed_expert_counts=route_window.tolist(),
+                       routed_expert_share=share.tolist(), dominant_windows=dominant_windows)
+                if dominant_windows >= 2:
+                    record(stage='routing_imbalance_warning', split='train', step=step,
+                           expert_id=architecture.expert_ids[dominant], routed_expert_share=share.tolist(),
+                           threshold=0.95, consecutive_windows=dominant_windows,
+                           message='One expert dominates consecutive 20-step windows; inspect validation task accuracy')
+                route_window.zero_()
             if policy.due(step):
                 validate_and_save(step)
         if policy.due(step, final=True):

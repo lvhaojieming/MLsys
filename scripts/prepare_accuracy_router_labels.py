@@ -22,7 +22,7 @@ from prepare_router_training_full import requests
 EXPERT_IDS = ['qwen3-14b/awq-w4a16/v1','qwen3-14b/gptq-w4a16/v1']
 GSM_NUMBER = re.compile(r'-?\d[\d,]*(?:\.\d+)?')
 GSM_HASH = re.compile(r'####\s*(-?\d[\d,]*(?:\.\d+)?)')
-MMLU_ANSWER = re.compile(r'(?i)(?:answer\s*(?:is|:)?|correct option\s*(?:is|:))\s*\(?\s*([A-D])(?:\b|\))')
+MMLU_ANSWER = re.compile(r'(?i)(?:answer|correct option)\s*(?:is\s*)?:?\s*\(?\s*([A-D])(?:\b|\))')
 
 
 def number_answer(text, reference=False):
@@ -53,6 +53,7 @@ def number_answer(text, reference=False):
 
 
 def mmlu_answer(text):
+    text = text.replace('**', '').replace('__', '')
     answers = MMLU_ANSWER.findall(text)
     if answers:
         return answers[-1].upper()
@@ -83,6 +84,7 @@ def main():
     p.add_argument('--validation-fraction',type=float,default=.10)
     p.add_argument('--seed',type=int,default=20261005)
     p.add_argument('--concurrency-per-endpoint',type=int,default=8)
+    p.add_argument('--reuse-gsm-labels', help='Reuse completed GSM8K answers with identical tokenized prompts')
     a=p.parse_args()
     if min(a.mmlu_samples,a.gsm_samples,a.concurrency_per_endpoint)<1 or not 0<a.validation_fraction<.5:
         p.error('positive sample counts and concurrency; validation fraction in (0,.5) required')
@@ -132,7 +134,7 @@ def main():
                 continue
             candidates.append(dict(id=source_id,source=source,group_id=group_id,category=category,
                 subject=selected_subjects.get(int(sid),'unknown') if source=='mmlu' else None,
-                input_ids=input_ids,target_ids=target_ids,max_new_tokens=1024 if source=='gsm8k' else 128,
+                input_ids=input_ids,target_ids=target_ids,max_new_tokens=1024,
                 reference_answer=answer,reference_value=str(correct_ref)))
             found+=1
         if source=='gsm8k' and found<a.gsm_samples:
@@ -175,14 +177,25 @@ def main():
             future.result()
 
     tasks=[Queue(),Queue()]
+    reused={}
+    if a.reuse_gsm_labels:
+        for line in Path(a.reuse_gsm_labels).read_text().splitlines():
+            row=json.loads(line)
+            if row['source']=='gsm8k':
+                reused[row['id']]=row
     for row in candidates:
+        if row['id'] in reused:
+            prior=reused[row['id']]
+            if any(prior[k]!=row[k] for k in ('input_ids','target_ids','split','reference_value','max_new_tokens')):
+                raise ValueError('reused GSM8K sample does not match new request')
+            continue
         for expert in range(2):
             tasks[expert].put(row)
     lock=threading.Lock()
     out_rows=out/'labeled.jsonl'
     cache_file=out/'expert-loss-cache.jsonl'
     started=time.monotonic()
-    completed=set()
+    completed=set(reused)
     def worker(expert,url,rows_stream,cache_stream):
         while True:
             try:
@@ -224,6 +237,7 @@ def main():
                         max_new_tokens=row['max_new_tokens'],expert_ids=EXPERT_IDS,
                         expert_losses=[pair[0]['loss'],pair[1]['loss']],expert_correctness=[pair[0]['correct'],pair[1]['correct']],
                         expert_answers=[pair[0]['answer'],pair[1]['answer']],reference_answer=row['reference_answer'],
+                        expert_finish_reasons=[pair[0]['finish_reason'],pair[1]['finish_reason']],
                         reference_value=row['reference_value'],tokens_sha256=digest)
                     rows_stream.write(json.dumps(label,ensure_ascii=False)+'\n');rows_stream.flush()
                     cache_stream.write(json.dumps(dict(id=row['id'],expert_ids=EXPERT_IDS,
@@ -236,6 +250,17 @@ def main():
     pending={}
     with out_rows.open('w') as rows_stream,cache_file.open('w') as cache_stream, \
             ThreadPoolExecutor(max_workers=sum(map(len,pools))*a.concurrency_per_endpoint) as workers:
+        for row in candidates:
+            if row['id'] in reused:
+                prior=reused[row['id']]
+                prior['expert_correctness']=[int(number_answer(answer)==Decimal(row['reference_value']))
+                                             for answer in prior['expert_answers']]
+                rows_stream.write(json.dumps(prior,ensure_ascii=False)+'\n')
+                cache_stream.write(json.dumps(dict(id=row['id'],expert_ids=EXPERT_IDS,
+                    expert_losses=prior['expert_losses'],target_tokens=len(row['target_ids']),
+                    tokens_sha256=prior['tokens_sha256']))+'\n')
+        rows_stream.flush(); cache_stream.flush()
+        print(json.dumps(dict(stage='reused_gsm_labels', samples=len(reused))),flush=True)
         futures=[workers.submit(worker,e,url,rows_stream,cache_stream) for e in range(2)
             for url in pools[e] for _ in range(a.concurrency_per_endpoint)]
         for future in futures:

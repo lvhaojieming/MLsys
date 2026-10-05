@@ -151,6 +151,7 @@ def save_checkpoint(
     architecture: RouterArchitecture,
     training_config: TrainingConfig,
     global_step: int,
+    best_validation_metric_name: str = "routing_regret",
 ) -> None:
     _atomic_torch_save(
         {
@@ -159,6 +160,7 @@ def save_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
             "best_validation_regret": best_validation_regret,
+            "best_validation_metric_name": best_validation_metric_name,
             "architecture_config": asdict(architecture),
             "training_config": asdict(training_config),
             "global_step": global_step,

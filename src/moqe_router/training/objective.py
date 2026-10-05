@@ -46,3 +46,42 @@ def loss_aware_terms(logits: Tensor, expert_losses: Tensor, temperature: float) 
 def loss_aware_router_loss(logits: Tensor, expert_losses: Tensor, temperature: float = 0.1) -> Tensor:
     ce, _ = loss_aware_terms(logits, expert_losses, temperature)
     return ce.mean()
+
+
+def accuracy_aware_terms(
+    logits: Tensor,
+    expert_losses: Tensor,
+    expert_correctness: Tensor,
+    temperature: float = 0.1,
+    nll_aux_weight: float = 0.1,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Per-sequence task-error CE plus a small NLL soft-target auxiliary term.
+
+    Correctness must be 0/1 in architecture expert order, or -1/-1 to denote
+    missing task labels. When both experts share an outcome, NLL soft targets
+    provide the only expert preference signal. Every example receives unit
+    weight; loss gaps never rescale sample contributions.
+    """
+    if logits.ndim != 2 or logits.shape != expert_losses.shape or logits.shape != expert_correctness.shape:
+        raise ValueError("logits, losses, and correctness must have matching [batch, experts] shapes")
+    if not math.isfinite(nll_aux_weight) or nll_aux_weight < 0:
+        raise ValueError("nll_aux_weight must be finite and nonnegative")
+    known = (expert_correctness >= 0).all(dim=-1)
+    if bool(((expert_correctness < 0).any(dim=-1) & (expert_correctness >= 0).any(dim=-1)).any()):
+        raise ValueError("correctness labels must mark every expert or none")
+    if bool((expert_correctness > 1).any()):
+        raise ValueError("correctness values must be 0/1 or -1 for missing")
+
+    nll_targets = build_loss_aware_targets(expert_losses, temperature)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    nll_ce = -(nll_targets * log_probs).sum(-1)
+
+    outcomes = expert_correctness.float().clamp_min(0)
+    outcome_total = outcomes.sum(-1, keepdim=True)
+    known_targets = outcomes / outcome_total.clamp_min(1)
+    # If both experts are correct or both are wrong, accuracy alone cannot
+    # prefer one. Use sequence NLL to break that tie.
+    accuracy_targets = torch.where(outcome_total > 0, known_targets, nll_targets)
+    correctness_ce = -(accuracy_targets * log_probs).sum(-1)
+    task_ce = torch.where(known, correctness_ce, nll_ce)
+    return task_ce + nll_aux_weight * nll_ce, correctness_ce, nll_ce, known

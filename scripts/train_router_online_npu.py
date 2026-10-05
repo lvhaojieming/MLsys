@@ -30,7 +30,7 @@ from moqe_router.config import RouterArchitecture
 from moqe_router.model import EmbeddingRouter
 from moqe_router.training.data import TrainingExample, collate_requests
 from moqe_router.training.embedding import FrozenEmbeddingProvider
-from moqe_router.training.objective import loss_aware_terms
+from moqe_router.training.objective import loss_aware_terms, accuracy_aware_terms
 from moqe_router.training.checkpoint_policy import BestCheckpointPolicy
 from moqe_router.training.trainer import TrainingConfig, build_scheduler, save_checkpoint
 
@@ -48,6 +48,7 @@ def main():
     parser.add_argument('--stream', action='store_true', help='Bounded-memory input using the preparation manifest')
     parser.add_argument('--raw-source-host', help='Host serving a CPU raw-tokenization stream on port 19190')
     parser.add_argument('--expert-concurrency', type=int, default=8, help='Maximum in-flight requests per expert instance')
+    parser.add_argument('--nll-aux-weight', type=float, default=0.1)
     args = parser.parse_args()
     if args.expert_concurrency < 1:
         parser.error('--expert-concurrency must be positive')
@@ -162,11 +163,14 @@ def main():
         with open(args.balanced_validation) as stream:
             diagnostic = [json.loads(line) for line in stream]
         diagnostic_groups = {r['group_id'] for r in diagnostic}
-        if not args.raw_source_host:
-            raise ValueError('diagnostic validation currently requires the group-filtered raw stream')
-        expected_digest = hashlib.sha256(json.dumps(sorted(diagnostic_groups)).encode()).hexdigest()
-        if header[0].get('excluded_groups_sha256') != expected_digest:
-            raise ValueError('raw stream must exclude exactly the diagnostic document groups')
+        if args.raw_source_host:
+            expected_digest = hashlib.sha256(json.dumps(sorted(diagnostic_groups)).encode()).hexdigest()
+            if header[0].get('excluded_groups_sha256') != expected_digest:
+                raise ValueError('raw stream must exclude exactly the diagnostic document groups')
+        else:
+            training_groups = {r['group_id'] for r in train}
+            if diagnostic_groups & training_groups:
+                raise ValueError('diagnostic validation overlaps training groups')
         if not diagnostic or diagnostic_groups & {r['group_id'] for r in valid}:
             raise ValueError('diagnostic validation must be nonempty and group-disjoint')
     diagnostic_header = [len(diagnostic)]
@@ -278,7 +282,11 @@ def main():
                 with (output/'expert-loss-cache.jsonl').open('a') as f:
                     f.write(json.dumps(value)+'\n')
                 cache[row['id']] = value
-            examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'], tuple(losses)))
+            correctness = row.get('expert_correctness')
+            if correctness is not None and (len(correctness) != 2 or any(v not in (0, 1, False, True) for v in correctness)):
+                raise ValueError('invalid expert correctness labels')
+            examples.append(TrainingExample(row['id'], tuple(row['input_ids']), row['max_new_tokens'],
+                                            tuple(losses), tuple(float(v) for v in correctness) if correctness is not None else None))
         elapsed = time.monotonic() - scoring_started
         record(stage='expert_scoring', samples=len(batch), new_scored_samples=len(pending),
                seconds=elapsed, new_samples_per_second=len(pending)/elapsed if pending else None)
@@ -321,9 +329,11 @@ def main():
         data = valid if data is None else data
         expected_count = valid_count if expected_count is None else expected_count
         router.eval()
-        numerator = denominator = regret = correct = count = 0.
+        numerator = denominator = regret = correct = count = task_correct = task_count = 0.
         expert_totals = torch.zeros(2, device=device)
         routed_counts = torch.zeros(2, device=device)
+        task_expert_counts = torch.zeros(2, device=device)
+        task_expert_correct = torch.zeros(2, device=device)
         oracle_counts = torch.zeros(2, device=device)
         correct_counts = torch.zeros(2, device=device)
         oracle_loss_total = 0.
@@ -333,38 +343,53 @@ def main():
                     logits = router(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
                 losses = batch['expert_losses']
                 ce, weights = loss_aware_terms(logits, losses, config.temperature)
+                correctness = batch['expert_correctness']
                 real = batch['real_mask']
                 numerator += (ce*weights*real).sum().item(); denominator += (weights*real).sum().item()
                 selected = logits.argmax(-1); oracle = losses.min(-1)
                 regret += ((losses.gather(1, selected[:, None]).squeeze(1)-oracle.values)*real).sum().item()
                 correct += ((selected == oracle.indices)*real).sum().item(); count += real.sum().item()
+                has_task_labels = (correctness >= 0).all(-1)
+                chosen_correct = correctness.gather(1, selected[:, None]).squeeze(1)
+                task_mask = real * has_task_labels.float()
+                task_correct += (chosen_correct.clamp_min(0) * task_mask).sum().item()
+                task_count += task_mask.sum().item()
+                task_expert_counts += ((correctness >= 0).float() * real[:, None]).sum(0)
+                task_expert_correct += (correctness.clamp_min(0) * real[:, None]).sum(0)
                 expert_totals += (losses*real[:, None]).sum(0)
                 routed_counts += torch.bincount(selected, weights=real, minlength=2)
                 oracle_counts += torch.bincount(oracle.indices, weights=real, minlength=2)
                 correct_counts += torch.bincount(oracle.indices, weights=real*(selected == oracle.indices), minlength=2)
                 oracle_loss_total += (oracle.values*real).sum().item()
-        summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total], device=device)
+        summary = torch.tensor([numerator, denominator, regret, correct, count, oracle_loss_total, task_correct, task_count], device=device)
         if world > 1:
             dist.all_reduce(summary)
             dist.all_reduce(expert_totals)
             dist.all_reduce(routed_counts)
+            dist.all_reduce(task_expert_counts)
+            dist.all_reduce(task_expert_correct)
             dist.all_reduce(oracle_counts)
             dist.all_reduce(correct_counts)
-        numerator, denominator, regret, correct, count, oracle_loss_total = summary.tolist()
+        numerator, denominator, regret, correct, count, oracle_loss_total, task_correct, task_count = summary.tolist()
         record(split=split, epoch=1, step=step, loss=numerator/denominator, mean_routing_regret=regret/count,
-               top1_accuracy=correct/count, sample_count=int(count),
+               nll_oracle_top1_accuracy=correct/count, task_accuracy=task_correct/task_count if task_count else None,
+               task_labeled_samples=int(task_count), sample_count=int(count),
+               fixed_expert_task_accuracy=(task_expert_correct/task_expert_counts.clamp_min(1)).tolist(),
                fixed_expert_mean_loss=(expert_totals/count).tolist(),
                fixed_expert_mean_regret=((expert_totals-oracle_loss_total)/count).tolist(),
                routed_expert_counts=routed_counts.tolist(),
                oracle_expert_counts=oracle_counts.tolist(),
                per_expert_oracle_recall=[float(correct_counts[i]/oracle_counts[i]) if oracle_counts[i] else None for i in range(2)])
         assert count == expected_count
-        improved = policy.observe(step, regret/count) if split == "valid" else False
+        selection_metric = 1.0-task_correct/task_count if task_count else regret/count
+        improved = policy.observe(step, selection_metric) if split == "valid" else False
         if rank == 0 and improved:
             save_checkpoint(output/'checkpoint_best.pt', router=router, optimizer=optimizer, scheduler=scheduler,
                 epoch=1, best_validation_regret=policy.best_regret, architecture=architecture,
-                training_config=config, global_step=step)
-            record(stage='best_checkpoint_saved', step=step, best_validation_regret=policy.best_regret)
+                training_config=config, global_step=step,
+                best_validation_metric_name='task_error' if task_count else 'routing_regret')
+            record(stage='best_checkpoint_saved', step=step, best_validation_metric=policy.best_regret,
+                   selection='task_error' if task_count else 'mean_routing_regret')
         if world > 1:
             dist.barrier()
         train_model.train()
@@ -372,7 +397,9 @@ def main():
             validate_and_save(step, diagnostic, "valid_balanced", diagnostic_count)
     record(stage='started', epochs=1, device='npu', train_samples=train_count, validation_samples=valid_count,
            expert_ids=architecture.expert_ids, loss='sequence_soft_target_cross_entropy',
-           tau=config.temperature, sample_weighting="uniform",
+           tau=config.temperature, sample_weighting="uniform", objective='accuracy_ce_plus_nll_aux',
+           checkpoint_policy='best_only_by_validation_task_accuracy',
+           nll_aux_weight=args.nll_aux_weight,
            frozen_embedding=True, full_prompt=True, synthetic=False,
            expert_concurrency=args.expert_concurrency, scoring_pools=pools, cached_samples=len(cache), score_window=args.score_window,
            world_size=world, batch_per_rank=config.batch_size, global_batch_size=global_batch,
@@ -386,9 +413,14 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('npu', dtype=torch.bfloat16):
                 logits = train_model(embedding(batch['input_ids']), batch['attention_mask'], batch['max_new_tokens'])
-            ce, weights = loss_aware_terms(logits, batch['expert_losses'], config.temperature)
+            total_per_sample, correctness_ce, nll_ce, has_correctness = accuracy_aware_terms(
+                logits, batch['expert_losses'], batch['expert_correctness'],
+                config.temperature, args.nll_aux_weight)
+            weights = torch.ones_like(total_per_sample)
             weights = weights * batch['real_mask']
-            weighted_sum = (ce*weights).sum()
+            weighted_sum = (total_per_sample*weights).sum()
+            correct_sum = (correctness_ce*weights).sum()
+            nll_sum = (nll_ce*weights).sum()
             denominator_tensor = weights.sum().detach()
             if world > 1:
                 dist.all_reduce(denominator_tensor)
@@ -405,12 +437,14 @@ def main():
             optimizer.step(); scheduler.step()
             totals = torch.stack((weighted_sum.detach(), weights.sum(), batch['real_mask'].sum(),
                 (batch['expert_losses'][:,0]*batch['real_mask']).sum(),
-                (batch['expert_losses'][:,1]*batch['real_mask']).sum()))
+                (batch['expert_losses'][:,1]*batch['real_mask']).sum(),
+                correct_sum.detach(), nll_sum.detach()))
             if world > 1:
                 dist.all_reduce(totals)
             step += 1; seen += int(totals[2].item())
             record(split='train', epoch=1, step=step, trained_samples=seen, loss=(totals[0]/totals[1]).item(),
                    weight_mean=(totals[1]/totals[2]).item(), weight_max=weights.max().item(),
+                   correctness_ce=(totals[5]/totals[1]).item(), nll_ce=(totals[6]/totals[1]).item(),
                    expert_loss_mean=(totals[3:5]/totals[2]).tolist(), grad_norm=norm.item(),
                    allocated_bytes=torch.npu.memory_allocated(), reserved_bytes=torch.npu.memory_reserved())
             if policy.due(step):

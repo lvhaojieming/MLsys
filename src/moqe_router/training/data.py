@@ -19,6 +19,7 @@ class TrainingExample:
     input_ids: tuple[int, ...]
     max_new_tokens: int
     expert_losses: tuple[float, ...]
+    expert_correctness: tuple[float, ...] | None = None
 
 
 class RequestDataset(Dataset[TrainingExample]):
@@ -115,11 +116,21 @@ class RequestDataset(Dataset[TrainingExample]):
                 "row expert_ids must exactly match RouterArchitecture.expert_ids order"
             )
 
+        correctness = row.get("expert_correctness")
+        if correctness is not None:
+            if (not isinstance(correctness, list) or len(correctness) != len(expert_ids)
+                    or any(value not in (0, 1, False, True) for value in correctness)):
+                raise ValueError("expert_correctness must contain one 0/1 label per expert")
+
         return TrainingExample(
             sample_id=sample_id,
             input_ids=tuple(input_ids),
             max_new_tokens=max_new_tokens,
             expert_losses=tuple(float(value) for value in losses),
+            expert_correctness=(
+                tuple(float(value) for value in row["expert_correctness"])
+                if row.get("expert_correctness") is not None else None
+            ),
         )
 
     def __len__(self) -> int:
@@ -151,5 +162,10 @@ def collate_requests(examples: list[TrainingExample]) -> dict[str, Tensor | list
         ),
         "expert_losses": torch.tensor(
             [example.expert_losses for example in examples], dtype=torch.float32
+        ),
+        "expert_correctness": torch.tensor(
+            [example.expert_correctness if example.expert_correctness is not None
+             else tuple(-1.0 for _ in example.expert_losses) for example in examples],
+            dtype=torch.float32,
         ),
     }

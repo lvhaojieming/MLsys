@@ -28,7 +28,22 @@ MMLU_ANSWER = re.compile(r'(?i)(?:answer\s*(?:is|:)?|correct option\s*(?:is|:))\
 def number_answer(text, reference=False):
     found = GSM_HASH.findall(text)
     if not found and not reference:
-        found = GSM_NUMBER.findall(text)
+        boxed = re.findall(r'\\boxed\{\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)\s*\}', text)
+        if boxed:
+            found = boxed
+        else:
+            # Final answers can repeat numbers from the question after the
+            # result, e.g. "60 days to write 3 books of 400 pages each".
+            plain = text.replace('**', '').replace('__', '')
+            markers = list(re.finditer(r'(?i)\b(?:final\s+)?answer\s*(?:is\b|:)', plain))
+            if markers:
+                conclusion = plain[markers[-1].end():].strip()
+                conclusion = conclusion.split('\n\n')[0]
+                equal_results = re.findall(r'=\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)', conclusion)
+                numbers = GSM_NUMBER.findall(conclusion)
+                found = equal_results[-1:] if equal_results else numbers[:1]
+            else:
+                found = GSM_NUMBER.findall(text)
     if not found:
         return None
     try:
